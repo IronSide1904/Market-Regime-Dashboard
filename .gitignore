@@ -1,0 +1,10 @@
+.env
+FINVIZ_AUTH_TOKEN.env
+Finviz API Token.env
+.streamlit/secrets.toml
+.venv/
+__pycache__/
+*.pyc
+streamlit.log
+streamlit.err.log
+streamlit_*.log
