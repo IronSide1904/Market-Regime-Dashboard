@@ -1,6 +1,7 @@
 # MR-1 Lite
 
 Searchable retail market regime and swing-trading dashboard built with Streamlit.
+Position regime analysis, volume, correlation, and performance comparison.
 
 ## Requirements
 
