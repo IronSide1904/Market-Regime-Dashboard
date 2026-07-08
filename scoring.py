@@ -32,6 +32,19 @@ def get_exposure(regime: str) -> float:
     return float(REGIME_RULES[regime]["exposure"])
 
 
+def apply_relative_context_adjustment(base_score: float, relative_context: dict) -> float:
+    if not relative_context or not relative_context.get("available"):
+        adjustment = 0
+    else:
+        adjustment = relative_context.get("score_adjustment", 0)
+    try:
+        adjustment = int(adjustment)
+    except (TypeError, ValueError):
+        adjustment = 0
+    adjustment = max(-10, min(10, adjustment))
+    return float(np.clip(float(base_score) + adjustment, 0, 100))
+
+
 def score_history(
     indicators: pd.DataFrame,
     ticker_ohlcv: pd.DataFrame | None = None,

@@ -15,6 +15,37 @@ DEFAULT_BENCHMARK = "SPY"
 BENCHMARKS = ["SPY", "QQQ"]
 HMM_TICKERS = ["SPY", "QQQ", "IWM", "RSP", "^VIX", "XLK", "XLU", "HYG", "TLT"]
 
+RELATIVE_CONTEXT_CONFIG = {
+    "enabled": True,
+    "default_benchmark": "SPY",
+    "secondary_benchmark": "QQQ",
+    "relative_z_window": 60,
+    "correlation_windows": [20, 60, 120],
+    "beta_windows": [20, 60],
+    "relative_trend_threshold": 0.03,
+    "correlation_drop_warning": 0.20,
+    "correlation_unstable_level": 0.25,
+    "beta_change_threshold": 0.25,
+    "strong_extension_z": 2.0,
+    "moderate_extension_z": 1.0,
+    "max_score_adjustment": 10,
+    "min_score_adjustment": -10,
+}
+
+SECTOR_ETF_MAP = {
+    "Technology": "XLK",
+    "Communication Services": "XLC",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Healthcare": "XLV",
+    "Financial Services": "XLF",
+    "Industrials": "XLI",
+    "Energy": "XLE",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+    "Basic Materials": "XLB",
+}
+
 TIMEFRAMES = {
     "5D": "3y",
     "10D": "3y",

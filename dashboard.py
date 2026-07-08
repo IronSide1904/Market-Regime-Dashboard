@@ -12,11 +12,12 @@ from config import (
     DEFAULT_BENCHMARK,
     DEFAULT_TICKER,
     REGIME_RULES,
+    RELATIVE_CONTEXT_CONFIG,
     SENSITIVITY_LOOKBACKS,
     SWING_TIMEFRAMES,
     TIMEFRAMES,
 )
-from data import fetch_market_data, get_ticker_metadata, normalize_ticker
+from data import fetch_market_data, get_benchmark_ohlcv, get_comparison_benchmark, get_ticker_metadata, normalize_ticker
 from events import EventContextResult, build_event_context
 from hmm_model import HMMResult, build_hmm_result
 from indicators import calculate_indicators
@@ -34,12 +35,16 @@ from regime_persistence import (
     analyze_regime_persistence,
     build_peer_persistence_table,
 )
+from relative_context import analyze_relative_context
 from scoring import (
+    apply_relative_context_adjustment,
     backtest_metrics,
     latest_signal_breakdown,
     main_drivers,
     run_backtest,
     score_history,
+    get_exposure,
+    get_regime,
 )
 from swing import SwingResult, build_swing_result
 
@@ -114,6 +119,39 @@ def render_dashboard() -> None:
     latest = scored.iloc[-1]
     context = get_asset_context(ticker=ticker, benchmark=benchmark)
 
+    comparison_benchmark = get_comparison_benchmark(
+        ticker=ticker,
+        metadata=ticker_metadata,
+        user_benchmark=benchmark,
+    )
+    if RELATIVE_CONTEXT_CONFIG.get("enabled", True):
+        with st.spinner(f"Loading {ticker} relative context vs {comparison_benchmark}..."):
+            benchmark_ohlcv = _load_benchmark_ohlcv(comparison_benchmark, period="1y")
+            relative_context = analyze_relative_context(
+                ticker=ticker,
+                benchmark=comparison_benchmark,
+                ticker_ohlcv=market_data.ticker_ohlcv,
+                benchmark_ohlcv=benchmark_ohlcv,
+                ticker_volume_metrics=_ticker_relative_volume_metrics(latest),
+                benchmark_volume_metrics=_benchmark_relative_volume_metrics(benchmark_ohlcv),
+            )
+    else:
+        benchmark_ohlcv = pd.DataFrame()
+        relative_context = {
+            "available": False,
+            "ticker": ticker.upper(),
+            "benchmark": comparison_benchmark.upper(),
+            "relationship_status": "Unavailable",
+            "score_adjustment": 0,
+            "confidence": "Low",
+            "interpretation": "Relative Context is disabled.",
+            "warnings": ["Relative Context is disabled."],
+            "history": pd.DataFrame(),
+        }
+    relative_adjusted_score = int(round(apply_relative_context_adjustment(float(latest["MR-1 Score"]), relative_context)))
+    relative_adjusted_regime = get_regime(relative_adjusted_score)
+    relative_adjusted_exposure = get_exposure(relative_adjusted_regime)
+
     _render_last_updated(last_updated_slot, scored.index[-1])
     for warning in market_data.warnings:
         st.warning(warning)
@@ -152,6 +190,7 @@ def render_dashboard() -> None:
             "Performance Comparison",
             "Peers / Sector / Industry / Theme",
             "Recommendation",
+            "Relative Context",
             "Swing Trading",
         ]
     )
@@ -178,6 +217,13 @@ def render_dashboard() -> None:
             exposure=float(latest["Exposure"]),
             positive_driver=positive_driver,
             negative_driver=negative_driver,
+        )
+        _render_relative_context_card(
+            relative_context=relative_context,
+            base_score=int(latest["MR-1 Score"]),
+            adjusted_score=relative_adjusted_score,
+            adjusted_regime=relative_adjusted_regime,
+            adjusted_exposure=relative_adjusted_exposure,
         )
         _render_regime_score_analysis(scored=scored, signals=signals, latest_regime=str(latest["Regime"]))
         _render_hmm_summary(hmm_result=hmm_result, rule_regime=str(latest["Regime"]))
@@ -274,6 +320,16 @@ def render_dashboard() -> None:
             event_context=event_context,
         )
 
+    elif active_tab == "Relative Context":
+        _render_scope_badges(
+            [
+                ("Layer", "Small MR-1 modifier"),
+                ("Benchmark", comparison_benchmark),
+                ("Score Impact", _format_signed_points(int(relative_context.get("score_adjustment", 0)))),
+            ]
+        )
+        _render_relative_context_detail(relative_context=relative_context)
+
     elif active_tab == "Swing Trading":
         _render_scope_badges(
             [
@@ -299,6 +355,11 @@ def render_dashboard() -> None:
 @st.cache_data(ttl=3600)
 def _load_hmm_result() -> HMMResult:
     return build_hmm_result()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_benchmark_ohlcv(benchmark: str, period: str = "1y") -> pd.DataFrame:
+    return get_benchmark_ohlcv(benchmark=benchmark, period=period)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1476,6 +1537,127 @@ def _render_v2_context_cards(
     _render_overlay_detail_tables(options_context=options_context, event_context=event_context)
 
 
+def _ticker_relative_volume_metrics(latest: pd.Series) -> dict:
+    return {
+        "rvol_20d": _optional_float(latest.get("RVOL 20D")),
+        "volume_percentile_1y": _optional_float(latest.get("Volume Percentile 1Y")),
+        "volume_z_score": _optional_float(latest.get("Volume Z-Score")),
+    }
+
+
+def _benchmark_relative_volume_metrics(benchmark_ohlcv: pd.DataFrame) -> dict:
+    if benchmark_ohlcv.empty or "Volume" not in benchmark_ohlcv.columns:
+        return {}
+    volume = pd.to_numeric(benchmark_ohlcv["Volume"], errors="coerce")
+    avg_20d = volume.rolling(20).mean()
+    rvol_20d = volume / avg_20d
+    percentile = volume.rolling(252).apply(lambda values: float((values <= values.iloc[-1]).mean() * 100), raw=False)
+    return {
+        "rvol_20d": _optional_float(rvol_20d.dropna().iloc[-1]) if not rvol_20d.dropna().empty else None,
+        "volume_percentile_1y": _optional_float(percentile.dropna().iloc[-1]) if not percentile.dropna().empty else None,
+    }
+
+
+def _render_relative_context_card(
+    relative_context: dict,
+    base_score: int,
+    adjusted_score: int,
+    adjusted_regime: str,
+    adjusted_exposure: float,
+) -> None:
+    st.subheader("Relative Context")
+    status = relative_context.get("relationship_status", "Unavailable")
+    score_adjustment = int(relative_context.get("score_adjustment", 0) or 0)
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Status", status)
+    col2.metric("Benchmark", relative_context.get("benchmark", "N/A"))
+    col3.metric("Relative 20D", _format_optional_signed_pct(relative_context.get("relative_20d")))
+    col4.metric("Score Impact", _format_signed_points(score_adjustment))
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("Relative Extension", _format_zscore(relative_context.get("relative_zscore")))
+    col6.metric("Relationship Stability", relative_context.get("correlation_trend", "Unavailable"))
+    col7.metric("Beta Trend", relative_context.get("beta_trend", "Unavailable"))
+    col8.metric("Volume Confirmation", relative_context.get("volume_confirmation", "Unavailable"))
+
+    adjusted_text = (
+        f"Relative-adjusted read: {adjusted_score}/100, {adjusted_regime}, "
+        f"{_format_pct(adjusted_exposure)} exposure. Base MR-1 remains {base_score}/100."
+    )
+    st.info(f"{relative_context.get('interpretation', 'Relative context unavailable.')} {adjusted_text}")
+    for warning in relative_context.get("warnings", [])[:2]:
+        st.warning(warning)
+
+
+def _render_relative_context_detail(relative_context: dict) -> None:
+    st.subheader("Relative Context")
+    if not relative_context.get("available"):
+        st.info(relative_context.get("interpretation", "Relative context unavailable."))
+        for warning in relative_context.get("warnings", []):
+            st.warning(warning)
+        return
+
+    st.info(relative_context.get("interpretation", "Relative context unavailable."))
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Status", relative_context.get("relationship_status", "Unavailable"))
+    col2.metric("Confidence", relative_context.get("confidence", "Low"))
+    col3.metric("Score Impact", _format_signed_points(int(relative_context.get("score_adjustment", 0) or 0)))
+    col4.metric("Benchmark", relative_context.get("benchmark", "N/A"))
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("5D Relative", _format_optional_signed_pct(relative_context.get("relative_5d")))
+    col6.metric("20D Relative", _format_optional_signed_pct(relative_context.get("relative_20d")))
+    col7.metric("60D Relative", _format_optional_signed_pct(relative_context.get("relative_60d")))
+    col8.metric("Extension", relative_context.get("relative_extension_label", "Unavailable"))
+
+    history = relative_context.get("history")
+    if history is None or history.empty:
+        st.info("Not enough data available.")
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(
+                _relative_ratio_chart(history, relative_context),
+                width="stretch",
+                key=f"relative_ratio_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
+            )
+        with c2:
+            st.plotly_chart(
+                _relative_zscore_chart(history),
+                width="stretch",
+                key=f"relative_zscore_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
+            )
+        c3, c4 = st.columns(2)
+        with c3:
+            st.plotly_chart(
+                _relative_correlation_chart(history),
+                width="stretch",
+                key=f"relative_corr_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
+            )
+        with c4:
+            st.plotly_chart(
+                _relative_beta_chart(history),
+                width="stretch",
+                key=f"relative_beta_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
+            )
+
+    st.plotly_chart(
+        _relative_rvol_chart(relative_context),
+        width="stretch",
+        key=f"relative_rvol_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
+    )
+
+    warnings = relative_context.get("warnings", [])
+    if warnings:
+        st.markdown("**Warnings**")
+        for warning in warnings:
+            st.warning(warning)
+
+    if DEBUG_MODE:
+        st.markdown("**Relative Context Debug**")
+        st.json(relative_context.get("debug", {}))
+
+
 def _render_overlay_detail_tables(
     options_context: OptionsVolatilityResult,
     event_context: EventContextResult,
@@ -2238,6 +2420,12 @@ def _format_optional_ratio(value) -> str:
     return f"{float(value):.2f}"
 
 
+def _format_zscore(value) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{float(value):+.2f} sigma"
+
+
 def _options_action(options_context: OptionsVolatilityResult) -> str:
     if options_context.context in {"IV Event Risk", "IV Stress"}:
         return "Reduce size"
@@ -2468,6 +2656,89 @@ def _options_iv_chart(options_context: OptionsVolatilityResult | None) -> go.Fig
     )
     fig.update_yaxes(tickformat=".1%")
     return _finish_chart(fig, title="Options IV vs Realized Volatility")
+
+
+def _relative_ratio_chart(history: pd.DataFrame, relative_context: dict) -> go.Figure:
+    fig = go.Figure()
+    if history.empty or "Relative Ratio" not in history.columns:
+        fig.add_annotation(text="Not enough data available.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        return _finish_chart(fig, title="Relative Strength Ratio")
+    fig.add_trace(
+        go.Scatter(
+            x=history.index,
+            y=history["Relative Ratio"],
+            name=f"{relative_context.get('ticker')} / {relative_context.get('benchmark')}",
+            line=dict(color="#38bdf8", width=2.5),
+        )
+    )
+    return _finish_chart(fig, title="Relative Strength Ratio")
+
+
+def _relative_zscore_chart(history: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if history.empty or "Relative Z-Score" not in history.columns:
+        fig.add_annotation(text="Not enough data available.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        return _finish_chart(fig, title="Relative Extension")
+    fig.add_trace(
+        go.Scatter(
+            x=history.index,
+            y=history["Relative Z-Score"],
+            name="Relative z-score",
+            line=dict(color="#f59e0b", width=2.4),
+        )
+    )
+    fig.add_hline(y=2, line=dict(color="#ef4444", width=1.4, dash="dash"), annotation_text="+2 extended")
+    fig.add_hline(y=-2, line=dict(color="#22c55e", width=1.4, dash="dash"), annotation_text="-2 weak")
+    return _finish_chart(fig, title="Relative Extension")
+
+
+def _relative_correlation_chart(history: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if history.empty:
+        fig.add_annotation(text="Not enough data available.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        return _finish_chart(fig, title="Rolling Correlation")
+    for column, color in [("Correlation 20D", "#38bdf8"), ("Correlation 60D", "#a78bfa"), ("Correlation 120D", "#94a3b8")]:
+        if column in history.columns:
+            fig.add_trace(go.Scatter(x=history.index, y=history[column], name=column, line=dict(color=color, width=2.2)))
+    fig.add_hline(y=0.25, line=dict(color="#ef4444", width=1.2, dash="dash"), annotation_text="Unstable area")
+    return _finish_chart(fig, title="Relationship Stability")
+
+
+def _relative_beta_chart(history: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if history.empty:
+        fig.add_annotation(text="Not enough data available.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        return _finish_chart(fig, title="Rolling Beta")
+    for column, color in [("Beta 20D", "#22c55e"), ("Beta 60D", "#f59e0b")]:
+        if column in history.columns:
+            fig.add_trace(go.Scatter(x=history.index, y=history[column], name=column, line=dict(color=color, width=2.2)))
+    fig.add_hline(y=1, line=dict(color="#94a3b8", width=1.2, dash="dash"), annotation_text="Market-like")
+    return _finish_chart(fig, title="Market Sensitivity")
+
+
+def _relative_rvol_chart(relative_context: dict) -> go.Figure:
+    fig = go.Figure()
+    values = [
+        relative_context.get("ticker_rvol_20d"),
+        relative_context.get("benchmark_rvol_20d"),
+    ]
+    labels = [
+        f"{relative_context.get('ticker', 'Ticker')} RVOL",
+        f"{relative_context.get('benchmark', 'Benchmark')} RVOL",
+    ]
+    if all(value is None or pd.isna(value) for value in values):
+        fig.add_annotation(text="Ticker vs benchmark RVOL is unavailable.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        return _finish_chart(fig, title="Ticker vs Benchmark Relative Volume")
+    fig.add_trace(
+        go.Bar(
+            x=labels,
+            y=values,
+            marker_color=["#38bdf8", "#94a3b8"],
+            hovertemplate="%{x}: %{y:.2f}x<extra></extra>",
+        )
+    )
+    fig.add_hline(y=1.2, line=dict(color="#f59e0b", width=1.2, dash="dash"), annotation_text="Elevated")
+    return _finish_chart(fig, title="Ticker vs Benchmark Relative Volume")
 
 
 def _regime_time_spent_chart(regime_persistence: RegimePersistenceResult | None) -> go.Figure:

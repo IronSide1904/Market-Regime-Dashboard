@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pandas as pd
 import yfinance as yf
 
-from config import MANUAL_FLOAT_SHARES, MARKET_TICKERS, MIN_TRADING_DAYS
+from config import MANUAL_FLOAT_SHARES, MARKET_TICKERS, MIN_TRADING_DAYS, RELATIVE_CONTEXT_CONFIG, SECTOR_ETF_MAP
 from finviz_fetcher import fetch_finviz_ticker_snapshot
 
 
@@ -82,6 +82,56 @@ def fetch_market_data(ticker: str, benchmark: str, period: str) -> MarketData:
     warnings = validate_market_data(close, required_columns=list(symbols.keys()))
     warnings.extend(validate_volume_data(ticker_ohlcv))
     return MarketData(close=close, ticker_ohlcv=ticker_ohlcv, warnings=warnings)
+
+
+def get_comparison_benchmark(
+    ticker: str,
+    metadata: dict,
+    user_benchmark: str | None = None,
+) -> str:
+    normalized_user = normalize_ticker(user_benchmark or "")
+    normalized_ticker = normalize_ticker(ticker)
+    if normalized_user and normalized_user != normalized_ticker:
+        return normalized_user
+
+    sector = metadata.get("sector") if metadata else None
+    sector_benchmark = SECTOR_ETF_MAP.get(str(sector)) if sector else None
+    if sector_benchmark:
+        return sector_benchmark
+
+    return RELATIVE_CONTEXT_CONFIG["default_benchmark"]
+
+
+def get_benchmark_ohlcv(benchmark: str, period: str = "1y") -> pd.DataFrame:
+    symbol = normalize_ticker(benchmark or RELATIVE_CONTEXT_CONFIG["default_benchmark"])
+    try:
+        downloaded = yf.download(
+            symbol,
+            period=period,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            group_by="column",
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    if downloaded.empty:
+        return pd.DataFrame()
+
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        fields = {}
+        for field in ["Open", "High", "Low", "Close", "Volume"]:
+            if field in downloaded.columns.get_level_values(0):
+                values = downloaded[field]
+                if isinstance(values, pd.DataFrame):
+                    fields[field] = values[symbol] if symbol in values.columns else values.iloc[:, 0]
+                else:
+                    fields[field] = values
+        return pd.DataFrame(fields).dropna(how="all") if fields else pd.DataFrame()
+
+    fields = {field: downloaded[field] for field in ["Open", "High", "Low", "Close", "Volume"] if field in downloaded.columns}
+    return pd.DataFrame(fields).dropna(how="all") if fields else pd.DataFrame()
 
 
 def get_ticker_metadata(ticker: str) -> dict:
