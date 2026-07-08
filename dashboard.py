@@ -407,7 +407,7 @@ def _render_sidebar() -> tuple[str, str, str, str]:
         )
         st.markdown("**Timeframe Scope**")
         st.caption("Dashboard Timeframe filters chart/backtest display range; it does not recalculate the latest score by itself.")
-        st.caption("Swing Timeframe only changes the focused swing return window.")
+        st.caption("Swing Timeframe changes the focused return window; the Swing Score uses fixed multi-window setup quality.")
         st.caption("Signal Sensitivity changes trend, VIX, relative-strength, breadth, and leadership lookbacks used by MR-1.")
         st.caption("Volume uses fixed 20D / 50D / 1Y windows plus Finviz average/current turnover.")
         st.caption("Swing volatility uses ATR 14D and realized volatility 20D.")
@@ -1961,6 +1961,10 @@ def _render_swing_trading(
         st.warning(warning)
 
     st.subheader("Swing Summary")
+    st.caption(
+        "Swing Score uses fixed multi-window setup quality: trend, 1M/3M relative strength, market regime, "
+        "sector/industry support, peer rank, and ATR risk. Swing TF only changes the focused return window shown below."
+    )
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Ticker", ticker)
     col2.metric("Swing Score", f"{swing_result.score} / 100")
@@ -1971,7 +1975,7 @@ def _render_swing_trading(
     col5, col6, col7, col8 = st.columns(4)
     col5.metric("Suggested Exposure", _format_pct(swing_result.exposure))
     col6.metric("Swing Timeframe", swing_timeframe)
-    col7.metric("Ticker Return", focus_return)
+    col7.metric(f"{swing_timeframe} Ticker Return", focus_return)
     col8.warning(f"Main Risk: {swing_result.main_risk}")
     st.info(f"Positive Driver: {swing_result.positive_driver}")
 
