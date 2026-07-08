@@ -126,7 +126,7 @@ def render_dashboard() -> None:
     )
     if RELATIVE_CONTEXT_CONFIG.get("enabled", True):
         with st.spinner(f"Loading {ticker} relative context vs {comparison_benchmark}..."):
-            benchmark_ohlcv = _load_benchmark_ohlcv(comparison_benchmark, period="1y")
+            benchmark_ohlcv = _load_benchmark_ohlcv(comparison_benchmark, period=TIMEFRAMES[timeframe_label])
             relative_context = analyze_relative_context(
                 ticker=ticker,
                 benchmark=comparison_benchmark,
@@ -639,8 +639,15 @@ def _render_volume_context_card(latest: pd.Series, ticker: str, ticker_metadata:
     )
     trend_badge = _volume_trend_badge(latest)
     debug_note = ""
-    if DEBUG_MODE and ticker_metadata.get("finviz_error"):
-        debug_note = f'<div class="volume-note">Finviz warning: {escape(str(ticker_metadata.get("finviz_error")))}</div>'
+    if DEBUG_MODE:
+        debug_parts = []
+        if ticker_metadata.get("finviz_error"):
+            debug_parts.append(f"Finviz warning: {ticker_metadata.get('finviz_error')}")
+        preview_url = (ticker_metadata.get("debug") or {}).get("preview_url")
+        if preview_url:
+            debug_parts.append(f"Finviz preview URL: {preview_url}")
+        if debug_parts:
+            debug_note = f'<div class="volume-note">{escape(" | ".join(str(part) for part in debug_parts))}</div>'
     finviz_note_html = f'<div class="volume-note">{escape(finviz_note)}</div>' if finviz_note else ""
     st.markdown(
         f"""
@@ -696,8 +703,12 @@ def _render_volume_context_card(latest: pd.Series, ticker: str, ticker_metadata:
                 <span>Float %: {_format_optional_pct(ticker_metadata.get("float_percent"))}</span>
                 <span>5D float turnover: {_format_optional_pct(latest.get("5D Float Turnover"))}</span>
                 <span>Trades: {_format_optional_number(ticker_metadata.get("trades"))}</span>
+                <span>RSI: {_format_optional_decimal(ticker_metadata.get("rsi"))}</span>
+                <span>Short ratio: {_format_optional_decimal(ticker_metadata.get("short_ratio"))}</span>
+                <span>Earnings: {escape(str(ticker_metadata.get("earnings_date") or "N/A"))}</span>
                 <span>{escape(str(ticker_metadata.get("sector") or "Sector unavailable"))}</span>
                 <span>{escape(str(ticker_metadata.get("industry") or "Industry unavailable"))}</span>
+                <span>{escape(str(ticker_metadata.get("country") or "Country unavailable"))}</span>
             </div>
             {debug_note}
             {finviz_note_html}
@@ -1566,6 +1577,7 @@ def _render_relative_context_card(
     adjusted_exposure: float,
 ) -> None:
     st.subheader("Relative Context")
+    st.caption("Compares the ticker with the active benchmark and adds a small confirmation/caution read. It does not replace the core MR-1 score.")
     status = relative_context.get("relationship_status", "Unavailable")
     score_adjustment = int(relative_context.get("score_adjustment", 0) or 0)
     col1, col2, col3, col4 = st.columns(4)
@@ -1593,11 +1605,13 @@ def _render_relative_context_detail(relative_context: dict) -> None:
     st.subheader("Relative Context")
     if not relative_context.get("available"):
         st.info(relative_context.get("interpretation", "Relative context unavailable."))
+        _render_relative_context_explainer(relative_context)
         for warning in relative_context.get("warnings", []):
             st.warning(warning)
         return
 
     st.info(relative_context.get("interpretation", "Relative context unavailable."))
+    _render_relative_context_explainer(relative_context)
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Status", relative_context.get("relationship_status", "Unavailable"))
     col2.metric("Confidence", relative_context.get("confidence", "Low"))
@@ -1621,12 +1635,14 @@ def _render_relative_context_detail(relative_context: dict) -> None:
                 width="stretch",
                 key=f"relative_ratio_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
             )
+            st.caption("Rising line means the ticker is outperforming the benchmark. Falling line means it is lagging, even if the stock price is still up.")
         with c2:
             st.plotly_chart(
                 _relative_zscore_chart(history),
                 width="stretch",
                 key=f"relative_zscore_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
             )
+            st.caption("Shows how stretched the ticker is versus its own recent relative trend. Above +2 is extended; below -2 is unusually weak.")
         c3, c4 = st.columns(2)
         with c3:
             st.plotly_chart(
@@ -1634,18 +1650,21 @@ def _render_relative_context_detail(relative_context: dict) -> None:
                 width="stretch",
                 key=f"relative_corr_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
             )
+            st.caption("Higher correlation means the benchmark is a useful comparison. 20D/60D/120D show tactical stability; YTD and 52W show the broader relationship.")
         with c4:
             st.plotly_chart(
                 _relative_beta_chart(history),
                 width="stretch",
                 key=f"relative_beta_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
             )
+            st.caption("Beta near 1 moves roughly like the benchmark. Above 1 is more sensitive; below 1 is calmer or more independent.")
 
     st.plotly_chart(
         _relative_rvol_chart(relative_context),
         width="stretch",
         key=f"relative_rvol_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
     )
+    st.caption("Relative volume compares current ticker participation with benchmark participation. Strong ticker RVOL can confirm a relative-strength move.")
 
     warnings = relative_context.get("warnings", [])
     if warnings:
@@ -1656,6 +1675,58 @@ def _render_relative_context_detail(relative_context: dict) -> None:
     if DEBUG_MODE:
         st.markdown("**Relative Context Debug**")
         st.json(relative_context.get("debug", {}))
+
+
+def _render_relative_context_explainer(relative_context: dict) -> None:
+    ticker = str(relative_context.get("ticker") or "Ticker").upper()
+    benchmark = str(relative_context.get("benchmark") or "Benchmark").upper()
+    st.markdown("**How to read this tab**")
+    st.caption(
+        f"Relative Context asks whether {ticker} is acting better or worse than {benchmark}. "
+        "Use it as confirmation and timing context, not as a standalone buy/sell signal."
+    )
+    guide = pd.DataFrame(
+        [
+            (
+                "Status",
+                "Overall relationship read: Supportive, Neutral, Warning, Broken, or Unavailable.",
+                "Supportive can reinforce a long setup. Warning/Broken says the benchmark comparison is not confirming cleanly.",
+            ),
+            (
+                "Score Impact",
+                "A small modifier applied to the MR-1 read, capped between -10 and +10 points.",
+                "Positive impact means relative context helps. Negative impact means caution. The original MR-1 score still remains the base.",
+            ),
+            (
+                "5D / 20D / 60D Relative",
+                f"{ticker} performance compared with {benchmark} over short, medium, and longer swing windows.",
+                "Positive values mean outperformance. Negative values mean the ticker is lagging the benchmark.",
+            ),
+            (
+                "Relative Extension",
+                "How far the ticker/benchmark ratio is from its recent average, shown as a z-score.",
+                "Very high readings can mean strength, but also a chase risk. Very low readings show unusual relative weakness.",
+            ),
+            (
+                "Relationship Stability",
+                "Ticker/benchmark correlation across tactical windows plus YTD and 52W context.",
+                "Stable/high readings make the benchmark useful. Weak/falling readings mean the ticker may be trading on its own drivers.",
+            ),
+            (
+                "Beta Trend",
+                "How sensitive the ticker has been to benchmark moves.",
+                "Rising/high beta means larger swings versus the benchmark. Falling/low beta means less market sensitivity.",
+            ),
+            (
+                "Volume Confirmation",
+                "Whether relative strength or weakness is supported by participation.",
+                "Outperformance with stronger ticker volume is more convincing than outperformance on quiet volume.",
+            ),
+        ],
+        columns=["Item", "Meaning", "Trading Read"],
+    )
+    st.dataframe(guide, use_container_width=True, hide_index=True, height=_table_height(guide))
+    st.caption("Rule of thumb: strong relative trend plus stable relationship plus volume confirmation is cleaner than any one metric alone.")
 
 
 def _render_overlay_detail_tables(
@@ -2697,9 +2768,22 @@ def _relative_correlation_chart(history: pd.DataFrame) -> go.Figure:
     if history.empty:
         fig.add_annotation(text="Not enough data available.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
         return _finish_chart(fig, title="Rolling Correlation")
-    for column, color in [("Correlation 20D", "#38bdf8"), ("Correlation 60D", "#a78bfa"), ("Correlation 120D", "#94a3b8")]:
+    for column, color, dash in [
+        ("Correlation 20D", "#38bdf8", "solid"),
+        ("Correlation 60D", "#a78bfa", "solid"),
+        ("Correlation 120D", "#94a3b8", "solid"),
+        ("Correlation YTD", "#22c55e", "dot"),
+        ("Correlation 52W", "#f59e0b", "dash"),
+    ]:
         if column in history.columns:
-            fig.add_trace(go.Scatter(x=history.index, y=history[column], name=column, line=dict(color=color, width=2.2)))
+            fig.add_trace(
+                go.Scatter(
+                    x=history.index,
+                    y=history[column],
+                    name=column,
+                    line=dict(color=color, width=2.2, dash=dash),
+                )
+            )
     fig.add_hline(y=0.25, line=dict(color="#ef4444", width=1.2, dash="dash"), annotation_text="Unstable area")
     return _finish_chart(fig, title="Relationship Stability")
 
@@ -3400,6 +3484,12 @@ def _format_optional_number(value) -> str:
     if abs(number) >= 1_000:
         return f"{number / 1_000:.2f}K"
     return f"{number:,.0f}"
+
+
+def _format_optional_decimal(value) -> str:
+    if pd.isna(value):
+        return "Unavailable"
+    return f"{float(value):.1f}"
 
 
 def _volume_status_class(context: str) -> str:

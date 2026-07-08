@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-from config import DEBUG_MODE, FINVIZ_COLUMNS, FINVIZ_CONFIG
+from config import DEBUG_MODE, FINVIZ_COLUMNS, FINVIZ_CONFIG, FINVIZ_DISCOVERY_COLUMNS
 
 
 load_dotenv()
@@ -21,9 +21,31 @@ NORMALIZED_FIELDS = [
     "company",
     "sector",
     "industry",
+    "country",
     "market_cap",
+    "pe",
+    "forward_pe",
+    "peg",
+    "ps",
+    "pb",
+    "pc",
+    "pfcf",
     "shares_outstanding",
     "shares_float",
+    "float_percent",
+    "short_float",
+    "short_ratio",
+    "short_interest",
+    "roa",
+    "roe",
+    "roi",
+    "current_ratio",
+    "quick_ratio",
+    "lt_debt_to_equity",
+    "debt_to_equity",
+    "gross_margin",
+    "operating_margin",
+    "profit_margin",
     "relative_volume",
     "average_volume",
     "volume",
@@ -33,11 +55,15 @@ NORMALIZED_FIELDS = [
     "beta",
     "volatility_week",
     "volatility_month",
+    "sma20",
+    "sma50",
+    "sma200",
+    "high52w",
+    "low52w",
+    "rsi",
     "change_from_open",
     "gap",
-    "short_float",
-    "short_interest",
-    "float_percent",
+    "earnings_date",
     "trades",
     "after_hours_volume",
 ]
@@ -47,31 +73,78 @@ COLUMN_ALIASES = {
     "company": ["company", "company_name", "name"],
     "sector": ["sector"],
     "industry": ["industry"],
+    "country": ["country"],
     "market_cap": ["market_cap", "marketcap", "market_capitalization"],
+    "pe": ["p_e", "pe"],
+    "forward_pe": ["forward_p_e", "forward_pe"],
+    "peg": ["peg"],
+    "ps": ["p_s", "ps"],
+    "pb": ["p_b", "pb"],
+    "pc": ["p_cash", "p_c", "pc"],
+    "pfcf": ["p_free_cash_flow", "p_fcf", "pfcf"],
     "shares_outstanding": ["shares_outstanding", "shs_outstand", "shs_outstanding", "shares_out"],
-    "shares_float": ["shares_float", "shs_float", "float_shares"],
+    "shares_float": ["shares_float", "shs_float", "float_shares", "float"],
+    "float_percent": ["float_outstanding", "float_percent", "float_pct", "float"],
+    "short_float": ["short_float", "float_short", "short_interest_share", "short_float_percent", "short_float_pct"],
+    "short_ratio": ["short_ratio", "short_interest_ratio"],
+    "short_interest": ["short_interest", "shares_short"],
+    "roa": ["return_on_assets", "roa"],
+    "roe": ["return_on_equity", "roe"],
+    "roi": ["return_on_invested_capital", "roi", "roic"],
+    "current_ratio": ["current_ratio"],
+    "quick_ratio": ["quick_ratio"],
+    "lt_debt_to_equity": ["lt_debt_equity", "lt_debt_to_equity"],
+    "debt_to_equity": ["debt_eq", "debt_equity", "total_debt_equity", "debt_to_equity"],
+    "gross_margin": ["gross_margin"],
+    "operating_margin": ["operating_margin"],
+    "profit_margin": ["profit_margin"],
     "relative_volume": ["relative_volume", "rel_volume", "rel_vol", "rvol"],
     "average_volume": ["average_volume", "avg_volume", "avg_vol"],
     "volume": ["volume", "current_volume"],
     "price": ["price", "last_price"],
     "change": ["change", "change_percent"],
-    "atr": ["atr", "average_true_range"],
+    "atr": ["average_true_range", "atr"],
     "beta": ["beta"],
     "volatility_week": ["volatility_week", "vol_week"],
     "volatility_month": ["volatility_month", "vol_month"],
+    "sma20": ["20_day_simple_moving_average", "sma20", "20_day_sma"],
+    "sma50": ["50_day_simple_moving_average", "sma50", "50_day_sma"],
+    "sma200": ["200_day_simple_moving_average", "sma200", "200_day_sma"],
+    "high52w": ["52w_high", "52_week_high"],
+    "low52w": ["52w_low", "52_week_low"],
+    "rsi": ["relative_strength_index_14", "rsi", "relative_strength_index"],
     "change_from_open": ["change_from_open"],
     "gap": ["gap"],
-    "short_float": ["short_float", "short_float_percent", "short_float_pct"],
-    "short_interest": ["short_interest", "shares_short"],
-    "float_percent": ["float", "float_percent", "float_outstanding"],
+    "earnings_date": ["earnings_date", "earnings"],
     "trades": ["trades"],
     "after_hours_volume": ["after_hours_volume", "afterhours_volume"],
 }
 
 NUMERIC_FIELDS = {
     "market_cap",
+    "pe",
+    "forward_pe",
+    "peg",
+    "ps",
+    "pb",
+    "pc",
+    "pfcf",
     "shares_outstanding",
     "shares_float",
+    "float_percent",
+    "short_float",
+    "short_ratio",
+    "short_interest",
+    "roa",
+    "roe",
+    "roi",
+    "current_ratio",
+    "quick_ratio",
+    "lt_debt_to_equity",
+    "debt_to_equity",
+    "gross_margin",
+    "operating_margin",
+    "profit_margin",
     "relative_volume",
     "average_volume",
     "volume",
@@ -81,16 +154,20 @@ NUMERIC_FIELDS = {
     "beta",
     "volatility_week",
     "volatility_month",
+    "sma20",
+    "sma50",
+    "sma200",
+    "high52w",
+    "low52w",
+    "rsi",
     "change_from_open",
     "gap",
-    "short_float",
-    "short_interest",
-    "float_percent",
     "trades",
     "after_hours_volume",
 }
 
-FINVIZ_UNIT_MULTIPLIERS = {
+IMPLIED_UNIT_MULTIPLIERS = {
+    "market_cap": 1_000_000,
     "shares_outstanding": 1_000_000,
     "shares_float": 1_000_000,
     "short_interest": 1_000_000,
@@ -112,15 +189,21 @@ def get_finviz_auth_token() -> str | None:
 
 
 def configured_finviz_columns() -> str | None:
-    configured_columns = [str(value) for value in FINVIZ_COLUMNS.values() if value]
+    configured_columns = [str(value) for value in FINVIZ_COLUMNS.values() if value is not None]
     return ",".join(configured_columns) if configured_columns else None
 
 
-def build_finviz_export_url(columns: str | None = None, filters: str | None = None) -> tuple[str, dict]:
+def build_finviz_export_url(
+    columns: str | None = None,
+    filters: str | None = None,
+    ticker: str | None = None,
+) -> tuple[str, dict]:
     params = {
         "v": FINVIZ_CONFIG["view"],
         "ft": FINVIZ_CONFIG["filter_type"],
     }
+    if ticker:
+        params["t"] = ticker.upper()
     requested_filters = FINVIZ_CONFIG["default_filters"] if filters is None else filters
     if requested_filters:
         params["f"] = requested_filters
@@ -130,12 +213,25 @@ def build_finviz_export_url(columns: str | None = None, filters: str | None = No
     return FINVIZ_CONFIG["base_url"], params
 
 
-def fetch_finviz_export(columns: str | None = None, filters: str | None = None) -> pd.DataFrame:
+def build_finviz_preview_url(
+    columns: str | None = None,
+    filters: str | None = None,
+    ticker: str | None = None,
+) -> str:
+    base_url, params = build_finviz_export_url(columns=columns, filters=filters, ticker=ticker)
+    return requests.Request("GET", base_url, params=params).prepare().url or base_url
+
+
+def fetch_finviz_export(
+    columns: str | None = None,
+    filters: str | None = None,
+    ticker: str | None = None,
+) -> pd.DataFrame:
     token = get_finviz_auth_token()
     if not token:
         raise ValueError("FINVIZ_AUTH_TOKEN is not configured.")
 
-    base_url, params = build_finviz_export_url(columns=columns, filters=filters)
+    base_url, params = build_finviz_export_url(columns=columns, filters=filters, ticker=ticker)
     params["auth"] = token
     response = requests.get(
         base_url,
@@ -159,18 +255,23 @@ def fetch_finviz_export(columns: str | None = None, filters: str | None = None) 
 
 
 @lru_cache(maxsize=16)
-def _cached_normalized_export(columns: str | None, filters: str) -> pd.DataFrame:
-    return normalize_finviz_dataframe(fetch_finviz_export(columns=columns, filters=filters))
+def _cached_normalized_export(columns: str | None, filters: str, ticker: str | None) -> pd.DataFrame:
+    return normalize_finviz_dataframe(fetch_finviz_export(columns=columns, filters=filters, ticker=ticker))
 
 
 def fetch_finviz_ticker_snapshot(ticker: str) -> dict:
     symbol = ticker.upper()
     try:
-        normalized = _cached_normalized_export(configured_finviz_columns(), FINVIZ_CONFIG["default_filters"])
+        columns = configured_finviz_columns()
+        filters = FINVIZ_CONFIG["default_filters"]
+        normalized = _cached_normalized_export(columns, filters, symbol)
         if "ticker" not in normalized.columns:
             return _unavailable("Finviz CSV did not include a ticker column.")
 
         rows = normalized[normalized["ticker"].astype(str).str.upper() == symbol]
+        if rows.empty:
+            normalized = _cached_normalized_export(columns, filters, None)
+            rows = normalized[normalized["ticker"].astype(str).str.upper() == symbol]
         if rows.empty:
             return _unavailable("Ticker not found in Finviz export.")
 
@@ -181,12 +282,33 @@ def fetch_finviz_ticker_snapshot(ticker: str) -> dict:
                 "available": True,
                 "source": "finviz",
                 "error": None,
-                "debug": _debug_payload(normalized) if DEBUG_MODE else {},
+                "debug": _debug_payload(normalized, preview_ticker=symbol, columns=columns) if DEBUG_MODE else {},
             }
         )
         return result
     except Exception as exc:
         return _unavailable(_clean_error(exc))
+
+
+def fetch_finviz_schema_discovery(ticker: str) -> dict:
+    symbol = ticker.upper()
+    try:
+        frame = fetch_finviz_export(columns=FINVIZ_DISCOVERY_COLUMNS, ticker=symbol)
+        return {
+            "available": True,
+            "preview_url": build_finviz_preview_url(columns=FINVIZ_DISCOVERY_COLUMNS, ticker=symbol),
+            "headers": list(frame.columns),
+            "row_count": int(frame.shape[0]),
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "preview_url": build_finviz_preview_url(columns=FINVIZ_DISCOVERY_COLUMNS, ticker=symbol),
+            "headers": [],
+            "row_count": 0,
+            "error": _clean_error(exc),
+        }
 
 
 def normalize_finviz_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -213,21 +335,19 @@ def normalize_finviz_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     for field in NUMERIC_FIELDS:
         if field in output.columns:
-            output[field] = output[field].map(parse_human_number)
+            output[field] = output[field].map(lambda value, field=field: parse_human_number(value, field=field))
             source_column = resolved_columns.get(field)
-            if field in FINVIZ_UNIT_MULTIPLIERS and source_column and not _column_has_explicit_unit(normalized[source_column]):
-                output[field] = output[field].map(
-                    lambda value: value * FINVIZ_UNIT_MULTIPLIERS[field] if value is not None else None
-                )
+            if field in IMPLIED_UNIT_MULTIPLIERS and source_column and not _column_has_explicit_unit(normalized[source_column]):
+                output[field] = output[field].map(lambda value, field=field: _apply_implied_unit(value, field))
 
     return output
 
 
-def parse_human_number(value):
+def parse_human_number(value, field: str | None = None):
     if pd.isna(value):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        return _normalize_numeric_value(float(value), field=field)
 
     text = str(value).strip()
     if not text or text in {"-", "N/A", "nan", "None"}:
@@ -244,9 +364,27 @@ def parse_human_number(value):
 
     text = text.replace(",", "")
     try:
-        return float(text) * multiplier
+        return _normalize_numeric_value(float(text) * multiplier, field=field)
     except ValueError:
         return None
+
+
+def _normalize_numeric_value(value: float, field: str | None = None) -> float:
+    return value
+
+
+def _apply_implied_unit(value, field: str):
+    if value is None or pd.isna(value):
+        return None
+    number = float(value)
+    multiplier = IMPLIED_UNIT_MULTIPLIERS.get(field)
+    if not multiplier:
+        return number
+    if field == "average_volume" and abs(number) >= 10_000_000:
+        return number
+    if field != "average_volume" and abs(number) >= 1_000_000_000:
+        return number
+    return number * multiplier
 
 
 def _normalize_column_name(column: str) -> str:
@@ -281,10 +419,11 @@ def _clean_error(exc: Exception) -> str:
     return message
 
 
-def _debug_payload(frame: pd.DataFrame) -> dict:
+def _debug_payload(frame: pd.DataFrame, preview_ticker: str | None = None, columns: str | None = None) -> dict:
     missing_fields = [field for field in NORMALIZED_FIELDS if field not in frame.columns or frame[field].isna().all()]
     return {
         "columns": list(frame.columns),
         "missing_fields": missing_fields,
         "row_count": int(frame.shape[0]),
+        "preview_url": build_finviz_preview_url(columns=columns, ticker=preview_ticker),
     }

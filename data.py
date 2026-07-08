@@ -171,9 +171,31 @@ def _yfinance_metadata(ticker: str) -> dict:
         "company": None,
         "sector": None,
         "industry": None,
+        "country": None,
         "market_cap": None,
+        "pe": None,
+        "forward_pe": None,
+        "peg": None,
+        "ps": None,
+        "pb": None,
+        "pc": None,
+        "pfcf": None,
         "shares_outstanding": None,
         "shares_float": MANUAL_FLOAT_SHARES.get(ticker),
+        "float_percent": None,
+        "short_float": None,
+        "short_ratio": None,
+        "short_interest": None,
+        "roa": None,
+        "roe": None,
+        "roi": None,
+        "current_ratio": None,
+        "quick_ratio": None,
+        "lt_debt_to_equity": None,
+        "debt_to_equity": None,
+        "gross_margin": None,
+        "operating_margin": None,
+        "profit_margin": None,
         "relative_volume": None,
         "average_volume": None,
         "volume": None,
@@ -183,11 +205,15 @@ def _yfinance_metadata(ticker: str) -> dict:
         "beta": None,
         "volatility_week": None,
         "volatility_month": None,
+        "sma20": None,
+        "sma50": None,
+        "sma200": None,
+        "high52w": None,
+        "low52w": None,
+        "rsi": None,
         "change_from_open": None,
         "gap": None,
-        "short_float": None,
-        "short_interest": None,
-        "float_percent": None,
+        "earnings_date": None,
         "trades": None,
         "after_hours_volume": None,
         "error": None,
@@ -206,9 +232,26 @@ def _yfinance_metadata(ticker: str) -> dict:
             "company": info.get("longName") or info.get("shortName"),
             "sector": info.get("sector"),
             "industry": info.get("industry"),
+            "country": info.get("country"),
             "market_cap": info.get("marketCap"),
+            "pe": info.get("trailingPE"),
+            "forward_pe": info.get("forwardPE"),
+            "peg": info.get("pegRatio"),
+            "ps": info.get("priceToSalesTrailing12Months"),
+            "pb": info.get("priceToBook"),
             "shares_outstanding": info.get("sharesOutstanding"),
             "shares_float": info.get("floatShares") or result["shares_float"],
+            "short_float": _fraction_or_none(info.get("shortPercentOfFloat")),
+            "short_ratio": info.get("shortRatio"),
+            "short_interest": info.get("sharesShort"),
+            "roa": _fraction_or_none(info.get("returnOnAssets")),
+            "roe": _fraction_or_none(info.get("returnOnEquity")),
+            "current_ratio": info.get("currentRatio"),
+            "quick_ratio": info.get("quickRatio"),
+            "debt_to_equity": info.get("debtToEquity"),
+            "gross_margin": _fraction_or_none(info.get("grossMargins")),
+            "operating_margin": _fraction_or_none(info.get("operatingMargins")),
+            "profit_margin": _fraction_or_none(info.get("profitMargins")),
             "average_volume": info.get("averageVolume"),
             "volume": info.get("volume"),
             "price": info.get("currentPrice") or info.get("regularMarketPrice"),
@@ -217,6 +260,18 @@ def _yfinance_metadata(ticker: str) -> dict:
         }
     )
     return result
+
+
+def _fraction_or_none(value):
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(number):
+        return None
+    return number
 
 
 def validate_market_data(close: pd.DataFrame, required_columns: list[str]) -> list[str]:

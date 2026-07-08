@@ -384,10 +384,28 @@ def _history_frame(relative_ratio: pd.Series, ticker_returns: pd.Series, benchma
     frame["Relative Z-Score"] = (relative_ratio - rolling_mean) / rolling_std
     for window in [20, 60, 120]:
         frame[f"Correlation {window}D"] = ticker_returns.rolling(window).corr(benchmark_returns)
+    frame["Correlation YTD"] = _year_to_date_correlation(ticker_returns, benchmark_returns)
+    frame["Correlation 52W"] = ticker_returns.rolling(252).corr(benchmark_returns)
     for window in [20, 60]:
         variance = benchmark_returns.rolling(window).var().replace(0, np.nan)
         frame[f"Beta {window}D"] = ticker_returns.rolling(window).cov(benchmark_returns) / variance
     return frame
+
+
+def _year_to_date_correlation(ticker_returns: pd.Series, benchmark_returns: pd.Series) -> pd.Series:
+    output = pd.Series(np.nan, index=ticker_returns.index, dtype="float64")
+    if ticker_returns.empty or benchmark_returns.empty:
+        return output
+
+    latest_date = pd.to_datetime(ticker_returns.index.max())
+    year_mask = pd.to_datetime(ticker_returns.index).year == latest_date.year
+    ticker_ytd = ticker_returns.loc[year_mask]
+    benchmark_ytd = benchmark_returns.loc[year_mask]
+    if ticker_ytd.shape[0] < 20:
+        return output
+
+    output.loc[ticker_ytd.index] = ticker_ytd.expanding(min_periods=20).corr(benchmark_ytd)
+    return output
 
 
 def _standardize_ohlcv(frame: pd.DataFrame) -> pd.DataFrame:
