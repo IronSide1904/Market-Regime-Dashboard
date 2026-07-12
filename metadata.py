@@ -4,8 +4,20 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import yfinance as yf
-from yfinance import EquityQuery
-from yfinance.const import SECTOR_INDUSTY_MAPPING
+
+try:
+    from yfinance import EquityQuery
+except Exception:
+    EquityQuery = None
+
+try:
+    from yfinance.const import SECTOR_INDUSTY_MAPPING
+except Exception:
+    SECTOR_INDUSTY_MAPPING = {
+        "Communication Services": ["Internet Content & Information"],
+        "Consumer Cyclical": ["Auto Manufacturers", "Internet Retail"],
+        "Technology": ["Consumer Electronics", "Semiconductors", "Software-Infrastructure", "Software-Application"],
+    }
 
 
 @dataclass(frozen=True)
@@ -199,6 +211,9 @@ def _screen_yahoo_industry_peers(
     fallback_peers: list[str],
     max_peers: int = 6,
 ) -> list[str]:
+    if EquityQuery is None:
+        return _dedupe_peers(ticker, fallback_peers, max_peers)
+
     query = EquityQuery(
         "and",
         [
