@@ -5004,3 +5004,7 @@ def _render_styles() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+if __name__ == "__main__":
+    render_dashboard()
