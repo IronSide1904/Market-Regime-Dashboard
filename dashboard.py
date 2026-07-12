@@ -326,7 +326,6 @@ def render_dashboard() -> None:
             regime_persistence=regime_persistence,
             options_context=options_context,
             event_context=event_context,
-            clean_relative_trend=clean_relative_trend,
         )
         _render_scope_badges([("Dashboard TF", timeframe_label), ("Charts", "Filtered display"), ("Score Scope", score_profile["scope"])])
         _render_charts(
@@ -378,7 +377,6 @@ def render_dashboard() -> None:
             volume_timeframe_config=volume_timeframe_config,
             options_context=options_context,
             event_context=event_context,
-            clean_relative_trend=clean_relative_trend,
         )
 
     elif active_tab == "Recommendation":
@@ -440,6 +438,7 @@ def render_dashboard() -> None:
             regime_persistence=regime_persistence,
             options_context=options_context,
             event_context=event_context,
+            clean_relative_trend=clean_relative_trend,
         )
 
 
@@ -1861,6 +1860,7 @@ def _render_v2_context_cards(
     regime_persistence: RegimePersistenceResult,
     options_context: OptionsVolatilityResult,
     event_context: EventContextResult,
+    clean_relative_trend: dict | None = None,
 ) -> None:
     st.subheader("Deeper Market Regime Score Analysis")
     col1, col2, col3 = st.columns(3)
@@ -3448,13 +3448,12 @@ def _relative_strength_quality_chart(clean_relative_trend: dict) -> go.Figure:
         )
         fig.update_layout(
             yaxis2=dict(
-                title="Correlation",
+                title=dict(text="Correlation", font=dict(color="#c4b5fd")),
                 overlaying="y",
                 side="right",
                 range=[-1, 1],
                 showgrid=False,
                 tickfont=dict(color="#c4b5fd"),
-                titlefont=dict(color="#c4b5fd"),
             )
         )
     details = clean_relative_trend.get("details", {})

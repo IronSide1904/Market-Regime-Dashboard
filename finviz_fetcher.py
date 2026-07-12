@@ -5,6 +5,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 import requests
@@ -14,6 +15,7 @@ from config import DEBUG_MODE, FINVIZ_COLUMNS, FINVIZ_CONFIG, FINVIZ_DISCOVERY_C
 
 
 load_dotenv()
+load_dotenv(Path(__file__).with_name("FINVIZ_AUTH_TOKEN.env"), override=False)
 load_dotenv(Path(__file__).with_name("Finviz API Token.env"), override=False)
 
 NORMALIZED_FIELDS = [
@@ -188,6 +190,15 @@ def get_finviz_auth_token() -> str | None:
     return os.getenv("FINVIZ_AUTH_TOKEN")
 
 
+def remove_dead_local_proxy() -> None:
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        value = os.environ.get(key, "")
+        if value.rstrip("/").lower() == "http://127.0.0.1:9":
+            os.environ.pop(key, None)
+    os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
+    os.environ.setdefault("no_proxy", "localhost,127.0.0.1,::1")
+
+
 def configured_finviz_columns() -> str | None:
     configured_columns = [str(value) for value in FINVIZ_COLUMNS.values() if value is not None]
     return ",".join(configured_columns) if configured_columns else None
@@ -227,6 +238,7 @@ def fetch_finviz_export(
     filters: str | None = None,
     ticker: str | None = None,
 ) -> pd.DataFrame:
+    remove_dead_local_proxy()
     token = get_finviz_auth_token()
     if not token:
         raise ValueError("FINVIZ_AUTH_TOKEN is not configured.")
@@ -412,11 +424,28 @@ def _unavailable(error: str) -> dict:
 
 def _clean_error(exc: Exception) -> str:
     message = str(exc) or exc.__class__.__name__
+    message = _redact_finviz_auth(message)
     if "FINVIZ_AUTH_TOKEN" in message:
         return "FINVIZ_AUTH_TOKEN missing or invalid."
     if "login" in message.lower() or "html" in message.lower():
         return "Finviz token missing, expired, or invalid."
     return message
+
+
+def _redact_finviz_auth(message: str) -> str:
+    redacted = re.sub(r"([?&]auth=)[^&\\s)'\\\"]+", r"\1<redacted>", message)
+    urls = re.findall(r"https?://[^\\s)'\\\"]+", redacted)
+    for url in urls:
+        try:
+            parts = urlsplit(url)
+            query = urlencode(
+                [(key, "<redacted>" if key.lower() == "auth" else value) for key, value in parse_qsl(parts.query, keep_blank_values=True)]
+            )
+            safe_url = urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+            redacted = redacted.replace(url, safe_url)
+        except Exception:
+            continue
+    return redacted
 
 
 def _debug_payload(frame: pd.DataFrame, preview_ticker: str | None = None, columns: str | None = None) -> dict:

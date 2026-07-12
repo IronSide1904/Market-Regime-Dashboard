@@ -5,6 +5,7 @@ Finviz API Token.env
 .venv/
 __pycache__/
 *.pyc
+.yfinance-cache/
 streamlit.log
 streamlit.err.log
 streamlit_*.log

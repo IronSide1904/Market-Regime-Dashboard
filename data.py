@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+from pathlib import Path
+import tempfile
+from uuid import uuid4
 
 import pandas as pd
 import yfinance as yf
 
 from config import MANUAL_FLOAT_SHARES, MARKET_TICKERS, MIN_TRADING_DAYS, RELATIVE_CONTEXT_CONFIG, SECTOR_ETF_MAP
-from finviz_fetcher import fetch_finviz_ticker_snapshot
+from finviz_fetcher import fetch_finviz_ticker_snapshot, remove_dead_local_proxy
+
+YFINANCE_CACHE_DIR = Path(tempfile.gettempdir()) / "mr1-yfinance-cache" / f"{os.getpid()}-{uuid4().hex}"
+_YFINANCE_CACHE_CONFIGURED = False
 
 
 @dataclass(frozen=True)
@@ -65,6 +72,8 @@ def normalize_ticker(ticker: str) -> str:
 
 
 def fetch_market_data(ticker: str, benchmark: str, period: str) -> MarketData:
+    remove_dead_local_proxy()
+    _configure_yfinance_cache()
     ticker = normalize_ticker(ticker)
     benchmark = normalize_ticker(benchmark)
     symbols = _symbols_for(ticker=ticker, benchmark=benchmark)
@@ -73,7 +82,7 @@ def fetch_market_data(ticker: str, benchmark: str, period: str) -> MarketData:
         period=period,
         auto_adjust=False,
         progress=False,
-        threads=True,
+        threads=False,
         group_by="column",
     )
 
@@ -103,6 +112,8 @@ def get_comparison_benchmark(
 
 
 def get_benchmark_ohlcv(benchmark: str, period: str = "1y") -> pd.DataFrame:
+    remove_dead_local_proxy()
+    _configure_yfinance_cache()
     symbol = normalize_ticker(benchmark or RELATIVE_CONTEXT_CONFIG["default_benchmark"])
     try:
         downloaded = yf.download(
@@ -164,6 +175,8 @@ def _is_missing_metadata_value(value) -> bool:
 
 
 def _yfinance_metadata(ticker: str) -> dict:
+    remove_dead_local_proxy()
+    _configure_yfinance_cache()
     result = {
         "available": False,
         "source": "unavailable",
@@ -272,6 +285,21 @@ def _fraction_or_none(value):
     if pd.isna(number):
         return None
     return number
+
+
+def _configure_yfinance_cache() -> None:
+    global _YFINANCE_CACHE_CONFIGURED
+    if _YFINANCE_CACHE_CONFIGURED:
+        return
+    try:
+        YFINANCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        if hasattr(yf, "cache") and hasattr(yf.cache, "set_cache_location"):
+            yf.cache.set_cache_location(str(YFINANCE_CACHE_DIR))
+        else:
+            yf.set_tz_cache_location(str(YFINANCE_CACHE_DIR))
+        _YFINANCE_CACHE_CONFIGURED = True
+    except Exception:
+        pass
 
 
 def validate_market_data(close: pd.DataFrame, required_columns: list[str]) -> list[str]:
