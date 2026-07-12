@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from html import escape
 
 import pandas as pd
@@ -10,12 +11,20 @@ from config import (
     APP_TITLE,
     DEBUG_MODE,
     DEFAULT_BENCHMARK,
+    DEFAULT_TIMEFRAME_PRESET,
     DEFAULT_TICKER,
     REGIME_RULES,
     RELATIVE_CONTEXT_CONFIG,
+    RELATIVE_TREND_QUALITY_CONFIG,
     SENSITIVITY_LOOKBACKS,
     SWING_TIMEFRAMES,
+    SWING_TIMEFRAME_TO_VOLATILITY_PRESET,
+    TIMEFRAME_PRESETS,
+    TIMEFRAME_TO_VOLUME_PRESET,
     TIMEFRAMES,
+    VOLUME_CONTEXT_CONFIG,
+    get_swing_timeframe_profile,
+    get_timeframe_score_profile,
 )
 from data import fetch_market_data, get_benchmark_ohlcv, get_comparison_benchmark, get_ticker_metadata, normalize_ticker
 from events import EventContextResult, build_event_context
@@ -36,6 +45,7 @@ from regime_persistence import (
     build_peer_persistence_table,
 )
 from relative_context import analyze_relative_context
+from relative_trend_quality import calculate_clean_relative_trend_score
 from scoring import (
     apply_relative_context_adjustment,
     backtest_metrics,
@@ -47,6 +57,7 @@ from scoring import (
     get_regime,
 )
 from swing import SwingResult, build_swing_result
+from volume import get_timeframe_config
 
 
 KNOWN_ETF_SYMBOLS = {
@@ -72,14 +83,36 @@ KNOWN_ETF_SYMBOLS = {
     "SOXX",
 }
 
+AUTO_VOLUME_PRESET_OPTION = "Auto (match Timeframe)"
+AUTO_VOLATILITY_PRESET_OPTION = "Auto (match Swing timeframe)"
+
 
 def render_dashboard() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="MR1", layout="wide")
     _render_styles()
 
     ticker, last_updated_slot = _render_top_bar()
-    benchmark, timeframe_label, swing_timeframe, sensitivity = _render_sidebar()
-    lookbacks = SENSITIVITY_LOOKBACKS[sensitivity]
+    (
+        benchmark,
+        timeframe_label,
+        swing_timeframe,
+        sensitivity,
+        volume_preset_choice,
+        volatility_preset_choice,
+        peer_override_mode,
+        peer_override_tickers,
+    ) = _render_sidebar()
+    score_profile = get_timeframe_score_profile(timeframe_label, sensitivity)
+    lookbacks = score_profile["lookbacks"]
+    swing_profile = get_swing_timeframe_profile(swing_timeframe)
+    volume_preset, volatility_preset = _resolve_volume_volatility_presets(
+        timeframe_label=timeframe_label,
+        swing_timeframe=swing_timeframe,
+        volume_preset_choice=volume_preset_choice,
+        volatility_preset_choice=volatility_preset_choice,
+    )
+    volume_timeframe_config = get_timeframe_config(volume_preset)
+    volatility_timeframe_config = get_timeframe_config(volatility_preset)
 
     with st.spinner(f"Loading {ticker} regime dashboard..."):
         market_data = fetch_market_data(
@@ -112,12 +145,18 @@ def render_dashboard() -> None:
         indicators,
         ticker_ohlcv=market_data.ticker_ohlcv,
         shares_float=shares_float,
+        volume_timeframe_config=volume_timeframe_config,
     )
     display_scored = _filter_scored_by_timeframe(scored, timeframe_label)
     signals = latest_signal_breakdown(scored, ticker=ticker, benchmark=benchmark)
     positive_driver, negative_driver = main_drivers(signals)
     latest = scored.iloc[-1]
-    context = get_asset_context(ticker=ticker, benchmark=benchmark)
+    context = _apply_peer_override(
+        context=get_asset_context(ticker=ticker, benchmark=benchmark),
+        ticker=ticker,
+        mode=peer_override_mode,
+        override_tickers=peer_override_tickers,
+    )
 
     comparison_benchmark = get_comparison_benchmark(
         ticker=ticker,
@@ -151,6 +190,17 @@ def render_dashboard() -> None:
     relative_adjusted_score = int(round(apply_relative_context_adjustment(float(latest["MR-1 Score"]), relative_context)))
     relative_adjusted_regime = get_regime(relative_adjusted_score)
     relative_adjusted_exposure = get_exposure(relative_adjusted_regime)
+    ticker_quality_ohlcv = market_data.ticker_ohlcv.copy()
+    benchmark_quality_ohlcv = benchmark_ohlcv.copy()
+    ticker_quality_ohlcv.attrs["symbol"] = ticker.upper()
+    benchmark_quality_ohlcv.attrs["symbol"] = comparison_benchmark.upper()
+    clean_relative_trend = calculate_clean_relative_trend_score(
+        ticker_df=ticker_quality_ohlcv,
+        benchmark_df=benchmark_quality_ohlcv,
+        timeframe=timeframe_label,
+        volume_context=_clean_relative_trend_volume_context(latest),
+        asset_type=_relative_trend_asset_type(ticker=ticker, metadata=ticker_metadata),
+    )
 
     _render_last_updated(last_updated_slot, scored.index[-1])
     for warning in market_data.warnings:
@@ -165,10 +215,14 @@ def render_dashboard() -> None:
             benchmark=benchmark,
             context=context,
             market_regime=str(latest["Regime"]),
+            swing_timeframe=swing_timeframe,
+            volatility_timeframe_config=volatility_timeframe_config,
         )
 
     regime_persistence = analyze_regime_persistence(display_scored)
-    latest_rvol = _optional_float(latest.get("RVOL 20D"))
+    latest_rvol = _optional_float(latest.get("RVOL Medium"))
+    if latest_rvol is None:
+        latest_rvol = _optional_float(latest.get("RVOL 20D"))
     with st.spinner(f"Loading {ticker} options and event overlays..."):
         options_context = _load_options_volatility_context(
             ticker=ticker,
@@ -198,7 +252,8 @@ def render_dashboard() -> None:
         _render_scope_badges(
             [
                 ("Score", "Latest MR-1 reading"),
-                ("Display TF", f"{timeframe_label} charts/backtest"),
+                ("Score Scope", score_profile["scope"]),
+                ("Dashboard TF", timeframe_label),
                 ("Sensitivity", sensitivity),
                 ("Signal Lookbacks", _lookback_summary(lookbacks)),
             ]
@@ -207,7 +262,10 @@ def render_dashboard() -> None:
             ticker=ticker,
             benchmark=benchmark,
             timeframe_label=timeframe_label,
+            score_scope=score_profile["scope"],
+            score_description=score_profile["description"],
             swing_timeframe=swing_timeframe,
+            swing_scope=swing_profile["scope"],
             sensitivity=sensitivity,
             signal_summary=_lookback_summary(lookbacks),
             core_score=int(latest["MR-1 Core Score"]),
@@ -225,14 +283,23 @@ def render_dashboard() -> None:
             adjusted_regime=relative_adjusted_regime,
             adjusted_exposure=relative_adjusted_exposure,
         )
+        _render_clean_relative_trend_card(clean_relative_trend, show_chart=True)
         _render_regime_score_analysis(scored=scored, signals=signals, latest_regime=str(latest["Regime"]))
         _render_hmm_summary(hmm_result=hmm_result, rule_regime=str(latest["Regime"]))
         _render_regime_guide(str(latest["Regime"]))
-        _render_scope_badges([("Reading", "Latest only"), ("Sensitivity", sensitivity)])
+        _render_scope_badges([("Reading", "Latest timeframe-aware score"), ("Sensitivity", sensitivity)])
         _render_signal_cards(signals)
         _render_scope_badges(
             [
-                ("Volume", "20D / 50D / 1Y"),
+                (
+                    "Volume",
+                    f"{volume_timeframe_config['volume_short_window']}D / "
+                    f"{volume_timeframe_config['volume_medium_window']}D / "
+                    f"{volume_timeframe_config['volume_long_window']}D",
+                ),
+                ("Volume Preset", volume_preset),
+                ("Volume Control", _preset_choice_label(volume_preset_choice)),
+                ("Swing Vol Control", _preset_choice_label(volatility_preset_choice)),
                 ("Float Turnover", "Finviz avg/current volume"),
                 ("Volatility", f"VIX {lookbacks['vix']}D"),
             ]
@@ -243,12 +310,15 @@ def render_dashboard() -> None:
             ticker_metadata=ticker_metadata,
             context=context,
             regime=str(latest["Regime"]),
+            timeframe_config=volume_timeframe_config,
         )
         _render_scope_badges(
             [
                 ("Options", "Multiple expirations"),
                 ("News", "24h / 7D"),
                 ("Regime Persistence", timeframe_label),
+                ("Volume Preset", volume_preset),
+                ("Swing Vol Preset", volatility_preset),
                 ("Event Risk", "7D / earnings proximity"),
             ]
         )
@@ -256,8 +326,9 @@ def render_dashboard() -> None:
             regime_persistence=regime_persistence,
             options_context=options_context,
             event_context=event_context,
+            clean_relative_trend=clean_relative_trend,
         )
-        _render_scope_badges([("Dashboard TF", timeframe_label), ("Charts", "Filtered display")])
+        _render_scope_badges([("Dashboard TF", timeframe_label), ("Charts", "Filtered display"), ("Score Scope", score_profile["scope"])])
         _render_charts(
             display_scored,
             ticker=ticker,
@@ -267,9 +338,20 @@ def render_dashboard() -> None:
         )
 
     elif active_tab == "Performance Comparison":
-        _render_scope_badges([("Dashboard TF", timeframe_label), ("Backtest", "Filtered display")])
+        _render_scope_badges([("Dashboard TF", timeframe_label), ("Backtest", "Filtered display"), ("Score Scope", score_profile["scope"])])
         _render_backtest(display_scored, ticker=ticker)
-        _render_scope_badges([("Swing Windows", "5D / 10D / 1M / 3M / QTD / YTD / 6M / 1Y")])
+        _render_mr1_regime_score_comparison(
+            ticker=ticker,
+            benchmark=benchmark,
+            context=context,
+            scored=scored,
+            timeframe_label=timeframe_label,
+            sensitivity=sensitivity,
+            lookbacks=lookbacks,
+            volume_timeframe_config=volume_timeframe_config,
+            key_prefix="performance",
+        )
+        _render_scope_badges([("Swing Windows", "5D / 10D / 1M / 2M / 3M / 4M / 6M / 8M / 10M / YTD / 1Y")])
         _render_performance_table(swing_result.performance_table, title="Swing Window Performance")
 
     elif active_tab == "Peers / Sector / Industry / Theme":
@@ -277,6 +359,7 @@ def render_dashboard() -> None:
             [
                 ("Dashboard TF", timeframe_label),
                 ("Swing TF", swing_timeframe),
+                ("Score Scope", score_profile["scope"]),
                 ("Volume", "Avg daily / current"),
                 ("Volatility", f"VIX {lookbacks['vix']}D"),
             ]
@@ -292,14 +375,17 @@ def render_dashboard() -> None:
             swing_timeframe=swing_timeframe,
             sensitivity=sensitivity,
             lookbacks=lookbacks,
+            volume_timeframe_config=volume_timeframe_config,
             options_context=options_context,
             event_context=event_context,
+            clean_relative_trend=clean_relative_trend,
         )
 
     elif active_tab == "Recommendation":
         _render_scope_badges(
             [
                 ("Reading", "Latest only"),
+                ("Score Scope", score_profile["scope"]),
                 ("Sensitivity", sensitivity),
                 ("HMM", "Market regime"),
                 ("Options", "Multiple expirations"),
@@ -318,12 +404,15 @@ def render_dashboard() -> None:
             regime_persistence=regime_persistence,
             options_context=options_context,
             event_context=event_context,
+            swing_result=swing_result,
+            clean_relative_trend=clean_relative_trend,
         )
 
     elif active_tab == "Relative Context":
         _render_scope_badges(
             [
                 ("Layer", "Small MR-1 modifier"),
+                ("Dashboard TF", timeframe_label),
                 ("Benchmark", comparison_benchmark),
                 ("Score Impact", _format_signed_points(int(relative_context.get("score_adjustment", 0)))),
             ]
@@ -334,8 +423,10 @@ def render_dashboard() -> None:
         _render_scope_badges(
             [
                 ("Swing TF", swing_timeframe),
-                ("ATR", "14D"),
-                ("Realized Vol", "20D"),
+                ("Swing Scope", swing_result.score_scope),
+                ("Vol Preset", volatility_preset),
+                ("ATR", f"{volatility_timeframe_config['atr_window']}D"),
+                ("Realized Vol", f"{volatility_timeframe_config['realized_vol_window']}D"),
                 ("Regime Filter", str(latest["Regime"])),
                 ("Options/Event", "Risk overlay"),
             ]
@@ -428,7 +519,7 @@ def _render_last_updated(
     )
 
 
-def _render_sidebar() -> tuple[str, str, str, str]:
+def _render_sidebar() -> tuple[str, str, str, str, str, str, str, list[str]]:
     with st.sidebar:
         st.header("Controls")
         if "active_benchmark" not in st.session_state:
@@ -454,7 +545,7 @@ def _render_sidebar() -> tuple[str, str, str, str]:
         timeframe_label = st.selectbox(
             "Timeframe",
             list(TIMEFRAMES.keys()),
-            index=list(TIMEFRAMES.keys()).index("3Y"),
+            index=list(TIMEFRAMES.keys()).index("1M"),
         )
         swing_timeframe = st.selectbox(
             "Swing timeframe",
@@ -466,15 +557,155 @@ def _render_sidebar() -> tuple[str, str, str, str]:
             options=list(SENSITIVITY_LOOKBACKS.keys()),
             value="Balanced",
         )
+        preset_options = list(TIMEFRAME_PRESETS.keys())
+        volume_preset_choice = st.selectbox(
+            "Volume Context preset",
+            [AUTO_VOLUME_PRESET_OPTION, *preset_options],
+            index=0,
+            format_func=_preset_option_label,
+            help="Auto follows Timeframe. Manual choices override only Volume Context windows.",
+        )
+        volatility_preset_choice = st.selectbox(
+            "Swing Volatility preset",
+            [AUTO_VOLATILITY_PRESET_OPTION, *preset_options],
+            index=0,
+            format_func=_preset_option_label,
+            help="Auto follows Swing timeframe. Manual choices override only ATR and realized-volatility windows.",
+        )
+        volume_preset, volatility_preset = _resolve_volume_volatility_presets(
+            timeframe_label=timeframe_label,
+            swing_timeframe=swing_timeframe,
+            volume_preset_choice=volume_preset_choice,
+            volatility_preset_choice=volatility_preset_choice,
+        )
+        st.caption(f"Volume Context: {_preset_scope_summary(volume_preset)} via {_preset_choice_label(volume_preset_choice)}.")
+        st.caption(f"Swing Volatility: {_volatility_scope_summary(volatility_preset)} via {_preset_choice_label(volatility_preset_choice)}.")
+        with st.expander("Peer Override", expanded=False):
+            peer_override_mode = st.radio(
+                "Peer override mode",
+                ["Auto", "Add to auto peers", "Replace auto peers"],
+                index=0,
+                help="Use Auto for curated/Yahoo peers. Add appends your tickers. Replace uses only your tickers.",
+            )
+            peer_override_text = st.text_input(
+                "Peer tickers",
+                value="",
+                placeholder="AMD, AVGO, MU, MRVL",
+                help="Comma or space separated. Crypto slash formats like BTC/USD are converted to BTC-USD.",
+            )
+            peer_override_tickers = _parse_ticker_list(peer_override_text)
+            if peer_override_mode == "Auto":
+                st.caption("Using the dashboard's curated/Yahoo peer logic.")
+            elif peer_override_tickers:
+                st.caption(f"{peer_override_mode}: {', '.join(peer_override_tickers)}")
+            else:
+                st.caption("Enter at least one ticker to activate the override.")
         st.markdown("**Timeframe Scope**")
-        st.caption("Dashboard Timeframe filters chart/backtest display range; it does not recalculate the latest score by itself.")
-        st.caption("Swing Timeframe changes the focused return window; the Swing Score uses fixed multi-window setup quality.")
-        st.caption("Signal Sensitivity changes trend, VIX, relative-strength, breadth, and leadership lookbacks used by MR-1.")
-        st.caption("Volume uses fixed 20D / 50D / 1Y windows plus Finviz average/current turnover.")
-        st.caption("Swing volatility uses ATR 14D and realized volatility 20D.")
+        st.caption("Timeframe: changes MR-1 score horizon, charts, backtests, and Volume Context when its preset is Auto.")
+        st.caption("Swing timeframe: changes Swing Score horizon, focused return window, and Swing Volatility when its preset is Auto.")
+        st.caption("Signal sensitivity: makes MR-1 slower/smoother or faster/noisier inside the selected Timeframe.")
+        st.caption(f"Volume Context preset: Auto follows Timeframe; manual choices affect volume only. Selected averages: {_preset_scope_summary(volume_preset)}.")
+        st.caption(f"Swing Volatility preset: Auto follows Swing timeframe; manual choices affect ATR/realized volatility only. Selected averages: {_volatility_scope_summary(volatility_preset)}.")
+        st.caption("Shorter settings react faster with more noise; longer settings are smoother but slower.")
+        if DEBUG_MODE or VOLUME_CONTEXT_CONFIG.get("show_advanced_controls", False):
+            with st.expander("Advanced timeframe details"):
+                volume_preset, volatility_preset = _resolve_volume_volatility_presets(
+                    timeframe_label=timeframe_label,
+                    swing_timeframe=swing_timeframe,
+                    volume_preset_choice=volume_preset_choice,
+                    volatility_preset_choice=volatility_preset_choice,
+                )
+                st.markdown("Volume Context")
+                st.json(get_timeframe_config(volume_preset))
+                st.markdown("Swing Volatility")
+                st.json(get_timeframe_config(volatility_preset))
         st.caption("Ticker search lives in the top bar.")
 
-    return benchmark or DEFAULT_BENCHMARK, timeframe_label, swing_timeframe, sensitivity
+    return (
+        benchmark or DEFAULT_BENCHMARK,
+        timeframe_label,
+        swing_timeframe,
+        sensitivity,
+        volume_preset_choice,
+        volatility_preset_choice,
+        peer_override_mode,
+        peer_override_tickers,
+    )
+
+
+def _parse_ticker_list(raw: str) -> list[str]:
+    tickers: list[str] = []
+    for token in str(raw or "").replace(",", " ").split():
+        symbol = normalize_ticker(token)
+        if symbol and symbol not in tickers:
+            tickers.append(symbol)
+    return tickers
+
+
+def _apply_peer_override(context, ticker: str, mode: str, override_tickers: list[str]):
+    if mode == "Auto" or not override_tickers:
+        return context
+
+    normalized_ticker = normalize_ticker(ticker)
+    clean_override = [symbol for symbol in override_tickers if symbol and symbol != normalized_ticker]
+    if not clean_override:
+        return context
+
+    if mode == "Replace auto peers":
+        peers = clean_override
+        source = "Manual peer override"
+    else:
+        peers = []
+        for symbol in [*context.peers, *clean_override]:
+            if symbol and symbol != normalized_ticker and symbol not in peers:
+                peers.append(symbol)
+        source = f"{context.peer_source} + manual peer override"
+
+    return replace(context, peers=peers, peer_source=source)
+
+
+def _resolve_volume_volatility_presets(
+    timeframe_label: str,
+    swing_timeframe: str,
+    volume_preset_choice: str,
+    volatility_preset_choice: str,
+) -> tuple[str, str]:
+    volume_preset = (
+        volume_preset_choice
+        if volume_preset_choice in TIMEFRAME_PRESETS
+        else TIMEFRAME_TO_VOLUME_PRESET.get(timeframe_label, DEFAULT_TIMEFRAME_PRESET)
+    )
+    volatility_preset = (
+        volatility_preset_choice
+        if volatility_preset_choice in TIMEFRAME_PRESETS
+        else SWING_TIMEFRAME_TO_VOLATILITY_PRESET.get(swing_timeframe, DEFAULT_TIMEFRAME_PRESET)
+    )
+    return volume_preset, volatility_preset
+
+
+def _preset_choice_label(choice: str) -> str:
+    return "Auto" if choice.startswith("Auto") else "Manual"
+
+
+def _preset_option_label(choice: str) -> str:
+    if choice.startswith("Auto"):
+        return choice
+    return f"{choice} - {_preset_scope_summary(choice)}; {_volatility_scope_summary(choice)}"
+
+
+def _preset_scope_summary(preset: str) -> str:
+    config = get_timeframe_config(preset)
+    percentile_window = int(config["volume_percentile_window"])
+    percentile_label = "1Y" if percentile_window >= 252 else f"{percentile_window}D"
+    return (
+        f"RVOL {config['volume_short_window']}/{config['volume_medium_window']}/{config['volume_long_window']}D, "
+        f"percentile {percentile_label}"
+    )
+
+
+def _volatility_scope_summary(preset: str) -> str:
+    config = get_timeframe_config(preset)
+    return f"ATR {config['atr_window']}D, realized vol {config['realized_vol_window']}D"
 
 
 def _render_scope_badges(items: list[tuple[str, str]]) -> None:
@@ -509,7 +740,10 @@ def _render_summary(
     ticker: str,
     benchmark: str,
     timeframe_label: str,
+    score_scope: str,
+    score_description: str,
     swing_timeframe: str,
+    swing_scope: str,
     sensitivity: str,
     signal_summary: str,
     core_score: int,
@@ -522,10 +756,9 @@ def _render_summary(
 ) -> None:
     st.subheader(f"Ticker: {ticker}")
     st.caption(
-        "Latest MR-1 score uses "
-        f"{sensitivity} signal lookbacks ({signal_summary}). "
-        f"Dashboard TF {timeframe_label} filters visible history/backtests; "
-        f"Swing TF {swing_timeframe} only affects swing-trading views."
+        f"Latest MR-1 score is timeframe-aware: {score_scope} scope from Dashboard TF {timeframe_label}, "
+        f"{sensitivity} sensitivity, and signals {signal_summary}. {score_description} "
+        f"Swing TF {swing_timeframe} uses a {swing_scope} swing-scoring horizon."
     )
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("MR-1 Core Score", f"{core_score} / 85")
@@ -622,10 +855,24 @@ def _render_signal_cards(signals) -> None:
             )
 
 
-def _render_volume_context_card(latest: pd.Series, ticker: str, ticker_metadata: dict, context, regime: str) -> None:
+def _render_volume_context_card(
+    latest: pd.Series,
+    ticker: str,
+    ticker_metadata: dict,
+    context,
+    regime: str,
+    timeframe_config: dict,
+) -> None:
     st.subheader("Volume Context")
     status_class = _volume_status_class(str(latest.get("Volume Context", "Unavailable")))
     adjustment = int(latest.get("Volume Adjustment", 0))
+    preset = str(latest.get("Volume Timeframe Preset", timeframe_config.get("preset", DEFAULT_TIMEFRAME_PRESET)))
+    short_window = int(latest.get("Volume Short Window", timeframe_config["volume_short_window"]))
+    medium_window = int(latest.get("Volume Medium Window", timeframe_config["volume_medium_window"]))
+    long_window = int(latest.get("Volume Long Window", timeframe_config["volume_long_window"]))
+    percentile_window = int(latest.get("Volume Percentile Window", timeframe_config["volume_percentile_window"]))
+    percentile_label = "1Y" if percentile_window >= 252 else f"{percentile_window}D"
+    float_turnover_labels = _float_turnover_summary(latest, timeframe_config)
     finviz_available = ticker_metadata.get("source") == "finviz" and bool(ticker_metadata.get("available"))
     finviz_status = "Available" if finviz_available else "Unavailable"
     finviz_note = "" if finviz_available else "Finviz data unavailable. Float turnover skipped unless another source provides shares float."
@@ -656,40 +903,40 @@ def _render_volume_context_card(latest: pd.Series, ticker: str, ticker_metadata:
                 <div>
                     <div class="volume-eyebrow">Volume Context</div>
                     <div class="volume-title">{escape(str(latest.get("Volume Context", "Unavailable")))}</div>
-                    <div class="volume-subtitle">{escape(str(latest.get("Volume Status", "Volume unavailable")))} | {trend_badge}</div>
+                    <div class="volume-subtitle">{escape(str(latest.get("Volume Status", "Volume unavailable")))} | {preset} | {trend_badge}</div>
                 </div>
                 <div class="volume-adjustment {status_class}">{adjustment:+d}</div>
             </div>
             <div class="volume-metric-grid">
                 <div class="volume-metric">
-                    <span>Historical RVOL</span>
-                    <strong>{_format_optional_multiple(latest.get("RVOL 20D"))}</strong>
-                    <small>20-day baseline</small>
+                    <span>RVOL {short_window}D</span>
+                    <strong>{_format_optional_multiple(latest.get("RVOL Short"))}</strong>
+                    <small>short window</small>
                 </div>
                 <div class="volume-metric">
-                    <span>1Y Percentile</span>
-                    <strong>{_format_optional_percentile(latest.get("Volume Percentile 1Y"))}</strong>
-                    <small>ticker history</small>
+                    <span>RVOL {medium_window}D</span>
+                    <strong>{_format_optional_multiple(latest.get("RVOL Medium"))}</strong>
+                    <small>medium confirmation</small>
                 </div>
                 <div class="volume-metric">
-                    <span>Avg Daily Float Turnover</span>
-                    <strong>{_format_optional_pct(avg_daily_float_turnover)}</strong>
-                    <small>Finviz average volume / float</small>
+                    <span>RVOL {long_window}D</span>
+                    <strong>{_format_optional_multiple(latest.get("RVOL Long"))}</strong>
+                    <small>long confirmation</small>
+                </div>
+                <div class="volume-metric">
+                    <span>Volume Percentile</span>
+                    <strong>{_format_optional_percentile(latest.get("Volume Percentile"))}</strong>
+                    <small>{percentile_label} selected window</small>
+                </div>
+                <div class="volume-metric">
+                    <span>Float Turnover</span>
+                    <strong>{_format_optional_pct(latest.get("Daily Float Turnover"))}</strong>
+                    <small>{escape(float_turnover_labels)}</small>
                 </div>
                 <div class="volume-metric">
                     <span>Finviz RVOL</span>
                     <strong>{_format_optional_multiple(ticker_metadata.get("relative_volume"))}</strong>
-                    <small>market cross-section</small>
-                </div>
-                <div class="volume-metric">
-                    <span>Gap / Open Change</span>
-                    <strong>{_format_optional_pct(ticker_metadata.get("gap"))}</strong>
-                    <small>{_format_optional_pct(ticker_metadata.get("change_from_open"))} from open</small>
-                </div>
-                <div class="volume-metric">
-                    <span>Finviz Volatility</span>
-                    <strong>{_format_optional_pct(ticker_metadata.get("volatility_month"))}</strong>
-                    <small>1M range</small>
+                    <small>Finviz-provided average/current volume</small>
                 </div>
             </div>
             <div class="volume-analysis">
@@ -701,7 +948,7 @@ def _render_volume_context_card(latest: pd.Series, ticker: str, ticker_metadata:
                 <span>Float: {_format_optional_number(ticker_metadata.get("shares_float"))}</span>
                 <span>Current float turnover: {_format_optional_pct(latest.get("Daily Float Turnover"))}</span>
                 <span>Float %: {_format_optional_pct(ticker_metadata.get("float_percent"))}</span>
-                <span>5D float turnover: {_format_optional_pct(latest.get("5D Float Turnover"))}</span>
+                <span>{escape(float_turnover_labels)}</span>
                 <span>Trades: {_format_optional_number(ticker_metadata.get("trades"))}</span>
                 <span>RSI: {_format_optional_decimal(ticker_metadata.get("rsi"))}</span>
                 <span>Short ratio: {_format_optional_decimal(ticker_metadata.get("short_ratio"))}</span>
@@ -955,21 +1202,105 @@ def _style_peer_events_table(table: pd.DataFrame):
 
 
 def _relevant_context_symbols(ticker: str, benchmark: str, context) -> list[str]:
+    return [symbol for symbol, _, _ in _regime_chart_assets(ticker=ticker, benchmark=benchmark, context=context)]
+
+
+def _regime_chart_assets(ticker: str, benchmark: str, context) -> list[tuple[str, str, str]]:
     candidates = [
-        ticker,
-        benchmark,
-        context.sector_etf,
-        context.industry_proxy,
-        context.theme_ticker,
-        context.sub_industry_ticker,
-        *context.peers,
+        (ticker, "Ticker", "Ticker"),
+        (benchmark, "Benchmark", "Benchmark"),
+        (context.sector_etf, "Sector ETF", "Sector"),
+        (context.industry_proxy, "Industry Proxy", "Industry"),
+        (context.theme_ticker, "Theme Proxy", "Theme"),
+        (context.sub_industry_ticker, "Sub-Industry Proxy", "Sub-Industry"),
+        *[(peer, "Peer", "Peer") for peer in context.peers],
     ]
-    symbols = []
-    for candidate in candidates:
+    assets = []
+    seen = set()
+    for candidate, role, group in candidates:
         symbol = str(candidate or "").upper()
-        if symbol and symbol not in symbols:
-            symbols.append(symbol)
-    return symbols
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            assets.append((symbol, role, group))
+    return assets
+
+
+def _render_mr1_regime_score_comparison(
+    ticker: str,
+    benchmark: str,
+    context,
+    scored: pd.DataFrame,
+    timeframe_label: str,
+    sensitivity: str,
+    lookbacks: dict[str, int],
+    volume_timeframe_config: dict,
+    key_prefix: str,
+) -> None:
+    st.subheader("MR-1 Regime Score Comparison")
+    assets = _regime_chart_assets(ticker=ticker, benchmark=benchmark, context=context)
+    symbols = tuple(symbol for symbol, _, _ in assets)
+    with st.spinner("Loading MR-1 score histories for comparison..."):
+        regime_histories = _load_peer_regime_histories(
+            symbols=symbols,
+            benchmark=benchmark.upper(),
+            period=TIMEFRAMES[timeframe_label],
+            lookback_items=tuple(sorted(lookbacks.items())),
+            volume_timeframe_items=_hashable_timeframe_config(volume_timeframe_config),
+        )
+    if not scored.empty:
+        regime_histories[ticker.upper()] = scored
+    if not regime_histories:
+        st.info("MR-1 score comparison is unavailable for the selected assets.")
+        return
+
+    label_by_symbol = {
+        symbol: f"{role}: {symbol}" if role != "Peer" else f"Peer: {symbol}"
+        for symbol, role, _ in assets
+        if symbol in regime_histories
+    }
+    symbol_by_label = {label: symbol for symbol, label in label_by_symbol.items()}
+    default_labels = [
+        label
+        for symbol, label in label_by_symbol.items()
+        if next((group for asset_symbol, _, group in assets if asset_symbol == symbol), "") != "Peer"
+    ]
+    if not default_labels:
+        default_labels = list(symbol_by_label.keys())[:4]
+
+    selected_labels = st.multiselect(
+        "Show MR-1 score lines",
+        options=list(symbol_by_label.keys()),
+        default=default_labels,
+        key=f"{key_prefix}_mr1_score_lines",
+        help="Toggle ticker, benchmark, sector/industry/theme proxies, and peers on or off.",
+    )
+    selected_symbols = {symbol_by_label[label] for label in selected_labels if label in symbol_by_label}
+    if not selected_symbols:
+        st.info("Select at least one line to show the MR-1 score chart.")
+        return
+
+    _render_scope_badges([("Dashboard TF", timeframe_label), ("Sensitivity", sensitivity), ("Benchmark", benchmark.upper())])
+    st.plotly_chart(
+        _peer_regime_score_chart(
+            regime_histories=regime_histories,
+            ticker=ticker.upper(),
+            timeframe_label=timeframe_label,
+            assets=assets,
+            selected_symbols=selected_symbols,
+        ),
+        width="stretch",
+        key=f"{key_prefix}_mr1_regime_scores_{ticker}_{benchmark}_{timeframe_label}_{sensitivity}",
+    )
+
+
+def _hashable_timeframe_config(timeframe_config: dict) -> tuple[tuple[str, object], ...]:
+    items = []
+    for key, value in timeframe_config.items():
+        if isinstance(value, list):
+            items.append((key, tuple(value)))
+        else:
+            items.append((key, value))
+    return tuple(sorted(items))
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -978,8 +1309,12 @@ def _load_peer_regime_histories(
     benchmark: str,
     period: str,
     lookback_items: tuple[tuple[str, int], ...],
+    volume_timeframe_items: tuple[tuple[str, object], ...],
 ) -> dict[str, pd.DataFrame]:
     lookbacks = dict(lookback_items)
+    volume_timeframe_config = dict(volume_timeframe_items)
+    if "float_turnover_windows" in volume_timeframe_config:
+        volume_timeframe_config["float_turnover_windows"] = list(volume_timeframe_config["float_turnover_windows"])
     histories: dict[str, pd.DataFrame] = {}
     for symbol in symbols:
         try:
@@ -995,6 +1330,7 @@ def _load_peer_regime_histories(
                 indicators,
                 ticker_ohlcv=market_data.ticker_ohlcv,
                 shares_float=metadata.get("shares_float"),
+                volume_timeframe_config=volume_timeframe_config,
             )
             if not scored.empty:
                 histories[symbol] = scored
@@ -1037,6 +1373,8 @@ def _peer_regime_score_chart(
     regime_histories: dict[str, pd.DataFrame],
     ticker: str,
     timeframe_label: str,
+    assets: list[tuple[str, str, str]] | None = None,
+    selected_symbols: set[str] | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     fig.add_hrect(y0=75, y1=100, fillcolor="#17803d", opacity=0.16, line_width=0, layer="below")
@@ -1045,19 +1383,24 @@ def _peer_regime_score_chart(
     fig.add_hline(y=75, line=dict(color="#22c55e", width=1.3, dash="dash"))
     fig.add_hline(y=45, line=dict(color="#f59e0b", width=1.3, dash="dash"))
 
+    asset_lookup = {symbol: (role, group) for symbol, role, group in assets or []}
+    selected_symbols = selected_symbols or set(regime_histories)
     for symbol, scored in regime_histories.items():
+        if symbol not in selected_symbols:
+            continue
         display = _filter_scored_by_timeframe(scored, timeframe_label)
         if display.empty or "MR-1 Score" not in display.columns:
             continue
         is_focus = symbol == ticker
+        role, group = asset_lookup.get(symbol, ("Peer", "Peer"))
         fig.add_trace(
             go.Scatter(
                 x=display.index,
                 y=display["MR-1 Score"],
-                name=symbol,
+                name=f"{role}: {symbol}" if role != "Ticker" else f"Ticker: {symbol}",
                 mode="lines",
                 line=dict(
-                    color="#38bdf8" if is_focus else None,
+                    color=_regime_score_line_color(group, is_focus),
                     width=3.4 if is_focus else 1.6,
                 ),
                 opacity=1.0 if is_focus else 0.68,
@@ -1067,6 +1410,20 @@ def _peer_regime_score_chart(
 
     fig.update_yaxes(range=[0, 100])
     return _finish_chart(fig, title="MR-1 Regime Scores: Ticker / Proxies / Peers")
+
+
+def _regime_score_line_color(group: str, is_focus: bool) -> str:
+    if is_focus:
+        return "#38bdf8"
+    colors = {
+        "Benchmark": "#f8fafc",
+        "Sector": "#22c55e",
+        "Industry": "#14b8a6",
+        "Theme": "#a78bfa",
+        "Sub-Industry": "#f59e0b",
+        "Peer": "#94a3b8",
+    }
+    return colors.get(group, "#94a3b8")
 
 
 def _build_peer_options_table(regime_histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -1082,7 +1439,7 @@ def _build_peer_options_table(regime_histories: dict[str, pd.DataFrame]) -> pd.D
             ticker=symbol,
             price_df=price_df,
             latest_regime=str(latest.get("Regime", "Unavailable")),
-            latest_rvol=_optional_float(latest.get("RVOL 20D")),
+            latest_rvol=_selected_rvol(latest),
             max_expirations=2,
         )
         rows.append(
@@ -1114,14 +1471,14 @@ def _build_peer_events_table(regime_histories: dict[str, pd.DataFrame], peer_opt
         latest = scored.iloc[-1]
         result = _load_event_context(
             ticker=symbol,
-            latest_rvol=_optional_float(latest.get("RVOL 20D")),
+            latest_rvol=_selected_rvol(latest),
             volume_context=str(latest.get("Volume Context", "Unavailable")),
             options_context=options_context_by_symbol.get(symbol, "Unavailable"),
         )
         rows.append(
             {
                 "Ticker": symbol,
-                "RVOL": _optional_float(latest.get("RVOL 20D")),
+                "RVOL": _selected_rvol(latest),
                 "News 24h": result.news_count_24h,
                 "News 7D": result.news_count_7d,
                 "Days to Earnings": result.days_to_earnings,
@@ -1550,10 +1907,45 @@ def _render_v2_context_cards(
 
 def _ticker_relative_volume_metrics(latest: pd.Series) -> dict:
     return {
-        "rvol_20d": _optional_float(latest.get("RVOL 20D")),
-        "volume_percentile_1y": _optional_float(latest.get("Volume Percentile 1Y")),
+        "rvol_20d": _selected_rvol(latest),
+        "volume_percentile_1y": _optional_float(latest.get("Volume Percentile")) or _optional_float(latest.get("Volume Percentile 1Y")),
         "volume_z_score": _optional_float(latest.get("Volume Z-Score")),
     }
+
+
+def _clean_relative_trend_volume_context(latest: pd.Series) -> dict:
+    return {
+        "context": latest.get("Volume Context"),
+        "volume_context": latest.get("Volume Context"),
+        "adjustment": latest.get("Volume Adjustment"),
+        "volume_adjustment": latest.get("Volume Adjustment"),
+        "rvol_medium": latest.get("RVOL Medium"),
+        "rvol_20d": latest.get("RVOL 20D"),
+        "volume_percentile": latest.get("Volume Percentile"),
+        "volume_percentile_1y": latest.get("Volume Percentile 1Y"),
+        "daily_return": _safe_latest_return(latest),
+    }
+
+
+def _safe_latest_return(latest: pd.Series) -> float | None:
+    return _optional_float(latest.get("Ticker Return")) or _optional_float(latest.get("Daily Return"))
+
+
+def _relative_trend_asset_type(ticker: str, metadata: dict) -> str:
+    symbol = str(ticker or "").upper()
+    name = str(metadata.get("company") or metadata.get("name") or "").lower() if metadata else ""
+    if symbol.endswith("-USD"):
+        return "crypto"
+    if any(token in name for token in ["inverse", "bear", "short"]):
+        return "inverse ETF"
+    if any(token in name for token in ["2x", "3x", "ultra", "leveraged"]):
+        return "leveraged ETF"
+    return str(metadata.get("quote_type") or metadata.get("source") or "standard")
+
+
+def _selected_rvol(latest: pd.Series):
+    value = _optional_float(latest.get("RVOL Medium"))
+    return value if value is not None else _optional_float(latest.get("RVOL 20D"))
 
 
 def _benchmark_relative_volume_metrics(benchmark_ohlcv: pd.DataFrame) -> dict:
@@ -1601,6 +1993,164 @@ def _render_relative_context_card(
         st.warning(warning)
 
 
+def _render_clean_relative_trend_card(clean_relative_trend: dict, show_chart: bool = False, compact: bool = False) -> None:
+    if not RELATIVE_TREND_QUALITY_CONFIG.get("enabled", True):
+        return
+
+    st.subheader("Clean Relative Trend")
+    if not clean_relative_trend.get("available", False):
+        st.info(clean_relative_trend.get("explanation", "Clean Relative Trend is unavailable."))
+        for warning in clean_relative_trend.get("warnings", [])[:3]:
+            st.warning(warning)
+        return
+
+    score = int(clean_relative_trend.get("score", 0))
+    label = str(clean_relative_trend.get("label", "Unavailable"))
+    status_class = _trend_quality_status_class(score)
+    st.markdown(
+        f"""
+        <div class="trend-quality-card signal-{status_class}">
+            <div class="volume-header">
+                <div>
+                    <div class="volume-eyebrow">Clean Relative Trend</div>
+                    <div class="volume-title">{score} / 100</div>
+                    <div class="volume-subtitle">{escape(label)} | {escape(str(clean_relative_trend.get("status", "Unavailable")))}</div>
+                </div>
+            </div>
+            <p>{escape(str(clean_relative_trend.get("explanation", "")))}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(3)
+    cols[0].metric(
+        "Relative Trend",
+        f"{int(clean_relative_trend.get('relative_trend_score', 0))} / {int(clean_relative_trend.get('relative_trend_max', 40))}",
+    )
+    cols[1].metric(
+        "Relationship Stability",
+        f"{int(clean_relative_trend.get('relationship_stability_score', 0))} / {int(clean_relative_trend.get('relationship_stability_max', 30))}",
+    )
+    cols[2].metric(
+        "Volume Confirmation",
+        f"{int(clean_relative_trend.get('volume_confirmation_score', 0))} / {int(clean_relative_trend.get('volume_confirmation_max', 30))}",
+    )
+    if not compact:
+        drivers = clean_relative_trend.get("positive_drivers", [])
+        warnings = clean_relative_trend.get("warnings", [])
+        if drivers:
+            st.caption("Drivers: " + "; ".join(drivers[:3]))
+        for warning in warnings[:3]:
+            st.warning(warning)
+    if show_chart:
+        with st.expander("Relative Strength Quality chart", expanded=False):
+            st.plotly_chart(
+                _relative_strength_quality_chart(clean_relative_trend),
+                width="stretch",
+                key=f"clean_relative_trend_chart_{clean_relative_trend.get('timeframe', 'tf')}",
+            )
+
+
+def _render_trend_quality_recommendation(clean_relative_trend: dict, benchmark: str) -> None:
+    st.subheader("Trend Quality")
+    if not clean_relative_trend.get("available", False):
+        st.info(clean_relative_trend.get("explanation", "Clean Relative Trend is unavailable."))
+        return
+
+    score = int(clean_relative_trend.get("score", 0))
+    label = clean_relative_trend.get("label", "Unavailable")
+    st.info(f"Clean Relative Trend Score: {score} / 100 - {label}")
+    st.write(clean_relative_trend.get("explanation", "Trend quality is unavailable."))
+    guide = pd.DataFrame(
+        [
+            ("Outperforming?", f"{int(clean_relative_trend.get('relative_trend_score', 0))} / {int(clean_relative_trend.get('relative_trend_max', 40))}", "Is the ticker leading the benchmark?"),
+            ("Stable enough?", f"{int(clean_relative_trend.get('relationship_stability_score', 0))} / {int(clean_relative_trend.get('relationship_stability_max', 30))}", f"Is the relationship with {benchmark} reliable enough to trust?"),
+            ("Volume confirms?", f"{int(clean_relative_trend.get('volume_confirmation_score', 0))} / {int(clean_relative_trend.get('volume_confirmation_max', 30))}", "Is participation supporting or contradicting the move?"),
+        ],
+        columns=["Question", "Score", "Read"],
+    )
+    st.dataframe(guide, use_container_width=True, hide_index=True, height=_table_height(guide))
+    drivers = clean_relative_trend.get("positive_drivers", [])
+    warnings = clean_relative_trend.get("warnings", [])
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Positive Drivers**")
+        if drivers:
+            for driver in drivers[:5]:
+                st.markdown(f"- {driver}")
+        else:
+            st.markdown("- No clean relative-trend drivers are confirmed.")
+    with col2:
+        st.markdown("**Warnings / Risks**")
+        if warnings:
+            for warning in warnings[:5]:
+                st.markdown(f"- {warning}")
+        else:
+            st.markdown("- No major trend-quality warnings are active.")
+
+
+def _render_overall_recommendation_summary(
+    ticker: str,
+    benchmark: str,
+    latest: pd.Series,
+    action: str,
+    exposure: float,
+    swing_result: SwingResult,
+    clean_relative_trend: dict,
+) -> None:
+    st.subheader("Overall Recommendation Summary")
+    clean_score = int(clean_relative_trend.get("score", 0)) if clean_relative_trend.get("available") else None
+    clean_label = str(clean_relative_trend.get("label", "Unavailable"))
+    relative_read = "Outperforming benchmark" if int(latest.get("Relative Strength Score", 0) or 0) > 0 else "Not outperforming benchmark"
+    rows = pd.DataFrame(
+        [
+            {"Layer": "MR-1 Score / Regime", "Read": f'{int(latest["MR-1 Score"])} / 100 - {latest["Regime"]}', "Takeaway": action},
+            {"Layer": "Suggested Exposure", "Read": _format_pct(exposure), "Takeaway": "Position size guide from MR-1"},
+            {"Layer": "Swing Score", "Read": f"{swing_result.score} / 100 - {swing_result.setup_label}", "Takeaway": swing_result.action},
+            {"Layer": "Volume Context", "Read": str(latest.get("Volume Context", "Unavailable")), "Takeaway": f'{int(latest.get("Volume Adjustment", 0) or 0):+d} MR-1 points'},
+            {"Layer": f"Relative Strength vs {benchmark}", "Read": relative_read, "Takeaway": f'{int(latest.get("Relative Strength Score", 0) or 0)} signal points'},
+            {"Layer": "Clean Relative Trend", "Read": "Unavailable" if clean_score is None else f"{clean_score} / 100 - {clean_label}", "Takeaway": clean_relative_trend.get("status", "Unavailable")},
+        ]
+    )
+    st.dataframe(rows, use_container_width=True, hide_index=True, height=_table_height(rows))
+    st.success(_overall_recommendation_conclusion(ticker, benchmark, latest, swing_result, clean_relative_trend, action))
+
+
+def _overall_recommendation_conclusion(
+    ticker: str,
+    benchmark: str,
+    latest: pd.Series,
+    swing_result: SwingResult,
+    clean_relative_trend: dict,
+    action: str,
+) -> str:
+    regime = str(latest.get("Regime", "Unavailable"))
+    volume_context = str(latest.get("Volume Context", "Unavailable"))
+    relative_positive = int(latest.get("Relative Strength Score", 0) or 0) > 0
+    clean_score = int(clean_relative_trend.get("score", 0)) if clean_relative_trend.get("available") else 0
+
+    if regime == "Risk-On" and clean_score >= 80 and swing_result.score >= 70:
+        return (
+            f"Conclusion: {ticker} has a high-quality trend setup. MR-1 supports risk, "
+            f"{ticker} is leading {benchmark}, swing conditions are favorable, and volume context is {volume_context}. "
+            "This supports trend-following or swing positioning with normal risk management."
+        )
+    if regime == "Defensive" or clean_score < 40:
+        return (
+            f"Conclusion: stay selective. The dashboard action is {action}, and the Clean Relative Trend read is not strong enough "
+            "to treat the move as a confirmed setup. Consider reducing exposure or waiting for cleaner relative strength and volume confirmation."
+        )
+    if relative_positive and clean_score >= 60:
+        return (
+            f"Conclusion: {ticker} has a usable but imperfect setup. It is outperforming {benchmark}, "
+            "but at least one confirmation layer still needs monitoring. Use smaller size or wait for the weaker layer to improve."
+        )
+    return (
+        f"Conclusion: the setup is mixed. MR-1 reads {regime}, but relative strength, swing quality, and volume are not fully aligned. "
+        "Use the dashboard as a watchlist signal until confirmation improves."
+    )
+
+
 def _render_relative_context_detail(relative_context: dict) -> None:
     st.subheader("Relative Context")
     if not relative_context.get("available"):
@@ -1635,14 +2185,24 @@ def _render_relative_context_detail(relative_context: dict) -> None:
                 width="stretch",
                 key=f"relative_ratio_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
             )
-            st.caption("Rising line means the ticker is outperforming the benchmark. Falling line means it is lagging, even if the stock price is still up.")
+            _render_relative_chart_explanation(
+                "Relative Strength Ratio",
+                "Shows the ticker divided by the benchmark. Rising means the ticker is leading the benchmark; falling means it is lagging.",
+                "Best use: confirm whether price strength is real leadership or just broad-market lift.",
+                "Watch out: a stock can rise while this line falls, meaning it is still underperforming the benchmark.",
+            )
         with c2:
             st.plotly_chart(
                 _relative_zscore_chart(history),
                 width="stretch",
                 key=f"relative_zscore_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
             )
-            st.caption("Shows how stretched the ticker is versus its own recent relative trend. Above +2 is extended; below -2 is unusually weak.")
+            _render_relative_chart_explanation(
+                "Relative Extension",
+                "Shows how stretched the ticker is versus its own recent relative trend.",
+                "Best use: timing. Positive extension supports momentum, but very high readings can mean chase risk.",
+                "Watch out: above +2 is extended; below -2 is unusually weak versus recent behavior.",
+            )
         c3, c4 = st.columns(2)
         with c3:
             st.plotly_chart(
@@ -1650,14 +2210,24 @@ def _render_relative_context_detail(relative_context: dict) -> None:
                 width="stretch",
                 key=f"relative_corr_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
             )
-            st.caption("Higher correlation means the benchmark is a useful comparison. 20D/60D/120D show tactical stability; YTD and 52W show the broader relationship.")
+            _render_relative_chart_explanation(
+                "Relationship Stability",
+                "Shows how closely the ticker and benchmark move together across tactical and broader windows.",
+                "Best use: decide whether the selected benchmark is a valid comparison for this ticker.",
+                "Watch out: falling or low correlation means relative-strength signals deserve less confidence.",
+            )
         with c4:
             st.plotly_chart(
                 _relative_beta_chart(history),
                 width="stretch",
                 key=f"relative_beta_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
             )
-            st.caption("Beta near 1 moves roughly like the benchmark. Above 1 is more sensitive; below 1 is calmer or more independent.")
+            _render_relative_chart_explanation(
+                "Market Sensitivity",
+                "Shows how much the ticker tends to move for a benchmark move.",
+                "Best use: position sizing and risk. Higher beta means larger swings versus the benchmark.",
+                "Watch out: rising beta can improve upside in Risk-On regimes but increases drawdown risk when the market weakens.",
+            )
 
     st.plotly_chart(
         _relative_rvol_chart(relative_context),
@@ -1665,6 +2235,12 @@ def _render_relative_context_detail(relative_context: dict) -> None:
         key=f"relative_rvol_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
     )
     st.caption("Relative volume compares current ticker participation with benchmark participation. Strong ticker RVOL can confirm a relative-strength move.")
+    _render_relative_chart_explanation(
+        "Ticker vs Benchmark Relative Volume",
+        "Compares current participation in the ticker against participation in the benchmark.",
+        "Best use: confirmation. Strong ticker RVOL supports a relative-strength move when price leadership is already present.",
+        "Watch out: high RVOL on down moves can be distribution, not confirmation.",
+    )
 
     warnings = relative_context.get("warnings", [])
     if warnings:
@@ -1675,6 +2251,20 @@ def _render_relative_context_detail(relative_context: dict) -> None:
     if DEBUG_MODE:
         st.markdown("**Relative Context Debug**")
         st.json(relative_context.get("debug", {}))
+
+
+def _render_relative_chart_explanation(title: str, meaning: str, best_use: str, watch_out: str) -> None:
+    st.markdown(
+        f"""
+        <div class="chart-note">
+            <strong>{escape(title)}</strong><br>
+            {escape(meaning)}<br>
+            {escape(best_use)}<br>
+            {escape(watch_out)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _render_relative_context_explainer(relative_context: dict) -> None:
@@ -1826,6 +2416,8 @@ def _render_recommendation(
     regime_persistence: RegimePersistenceResult,
     options_context: OptionsVolatilityResult,
     event_context: EventContextResult,
+    swing_result: SwingResult,
+    clean_relative_trend: dict,
 ) -> None:
     action = _recommendation_action(latest_score, latest_regime)
     confidence = _confidence_label(latest_score, signals)
@@ -1849,6 +2441,19 @@ def _render_recommendation(
         hmm_result=hmm_result,
     ):
         st.write(paragraph)
+
+    if RELATIVE_TREND_QUALITY_CONFIG.get("show_in_recommendation", True):
+        _render_trend_quality_recommendation(clean_relative_trend, benchmark=benchmark)
+
+    _render_overall_recommendation_summary(
+        ticker=ticker,
+        benchmark=benchmark,
+        latest=scored.iloc[-1],
+        action=action,
+        exposure=exposure,
+        swing_result=swing_result,
+        clean_relative_trend=clean_relative_trend,
+    )
 
     st.subheader("Volume Explanation")
     st.write(scored.iloc[-1].get("Volume Explanation", "Volume context is unavailable."))
@@ -1927,6 +2532,7 @@ def _render_peer_context(
     swing_timeframe: str,
     sensitivity: str,
     lookbacks: dict[str, int],
+    volume_timeframe_config: dict,
     options_context: OptionsVolatilityResult,
     event_context: EventContextResult,
 ) -> None:
@@ -2012,19 +2618,45 @@ def _render_peer_context(
         benchmark=benchmark.upper(),
         period=TIMEFRAMES[timeframe_label],
         lookback_items=tuple(sorted(lookbacks.items())),
+        volume_timeframe_items=_hashable_timeframe_config(volume_timeframe_config),
     )
     if regime_histories:
         st.markdown("**MR-1 Regime Score History**")
-        _render_scope_badges([("Dashboard TF", timeframe_label), ("Sensitivity", sensitivity), ("Benchmark", benchmark.upper())])
-        st.plotly_chart(
-            _peer_regime_score_chart(
-                regime_histories=regime_histories,
-                ticker=ticker.upper(),
-                timeframe_label=timeframe_label,
-            ),
-            width="stretch",
-            key=f"peer_regime_scores_{ticker}_{benchmark}_{timeframe_label}_{sensitivity}",
+        chart_assets = _regime_chart_assets(ticker=ticker, benchmark=benchmark, context=context)
+        label_by_symbol = {
+            symbol: f"{role}: {symbol}" if role != "Peer" else f"Peer: {symbol}"
+            for symbol, role, _ in chart_assets
+            if symbol in regime_histories
+        }
+        symbol_by_label = {label: symbol for symbol, label in label_by_symbol.items()}
+        default_labels = [
+            label
+            for symbol, label in label_by_symbol.items()
+            if next((group for asset_symbol, _, group in chart_assets if asset_symbol == symbol), "") != "Peer"
+        ]
+        selected_labels = st.multiselect(
+            "Show MR-1 score lines",
+            options=list(symbol_by_label.keys()),
+            default=default_labels or list(symbol_by_label.keys())[:4],
+            key=f"peer_mr1_score_lines_{ticker}_{benchmark}_{timeframe_label}_{sensitivity}",
+            help="Toggle ticker, benchmark, sector/industry/theme proxies, and peers on or off.",
         )
+        selected_symbols = {symbol_by_label[label] for label in selected_labels if label in symbol_by_label}
+        _render_scope_badges([("Dashboard TF", timeframe_label), ("Sensitivity", sensitivity), ("Benchmark", benchmark.upper())])
+        if selected_symbols:
+            st.plotly_chart(
+                _peer_regime_score_chart(
+                    regime_histories=regime_histories,
+                    ticker=ticker.upper(),
+                    timeframe_label=timeframe_label,
+                    assets=chart_assets,
+                    selected_symbols=selected_symbols,
+                ),
+                width="stretch",
+                key=f"peer_regime_scores_{ticker}_{benchmark}_{timeframe_label}_{sensitivity}",
+            )
+        else:
+            st.info("Select at least one line to show the MR-1 score chart.")
         peer_persistence = build_peer_persistence_table(regime_histories)
         if not peer_persistence.empty:
             st.markdown("**Peer Regime Persistence**")
@@ -2102,7 +2734,7 @@ def _render_peer_context_analysis(
     )
     swing_latest = swing_result.swing_frame.iloc[-1] if not swing_result.swing_frame.empty else pd.Series(dtype=float)
     atr_pct = _optional_float(swing_latest.get("ATR %"))
-    realized_vol = _optional_float(swing_latest.get("20D Realized Volatility"))
+    realized_vol = _optional_float(swing_latest.get("Realized Volatility")) or _optional_float(swing_latest.get("20D Realized Volatility"))
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Current Regime", regime)
@@ -2189,7 +2821,7 @@ def _ticker_volatility_read(atr_pct: float | None, realized_vol: float | None) -
     realized_text = (
         "realized volatility is unavailable"
         if realized_vol is None
-        else f"20D realized volatility is {_format_optional_pct(realized_vol)}"
+        else f"selected-window realized volatility is {_format_optional_pct(realized_vol)}"
     )
     if atr_pct is not None and atr_pct >= 0.07:
         risk_text = "volatility risk is high"
@@ -2209,14 +2841,15 @@ def _render_swing_trading(
     regime_persistence: RegimePersistenceResult,
     options_context: OptionsVolatilityResult,
     event_context: EventContextResult,
+    clean_relative_trend: dict,
 ) -> None:
     for warning in swing_result.warnings:
         st.warning(warning)
 
     st.subheader("Swing Summary")
     st.caption(
-        "Swing Score uses fixed multi-window setup quality: trend, 1M/3M relative strength, market regime, "
-        "sector/industry support, peer rank, and ATR risk. Swing TF only changes the focused return window shown below."
+        f"Swing Score is timeframe-aware: {swing_result.score_horizon} {swing_result.score_scope} scope. "
+        f"Signals: {swing_result.signal_summary}. Shorter swing horizons react faster but are noisier."
     )
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Ticker", ticker)
@@ -2231,6 +2864,8 @@ def _render_swing_trading(
     col7.metric(f"{swing_timeframe} Ticker Return", focus_return)
     col8.warning(f"Main Risk: {swing_result.main_risk}")
     st.info(f"Positive Driver: {swing_result.positive_driver}")
+    if RELATIVE_TREND_QUALITY_CONFIG.get("show_in_swing_tab", True):
+        _render_clean_relative_trend_card(clean_relative_trend, compact=True)
 
     st.subheader("HMM Market Risk Filter")
     if hmm_result.available:
@@ -2250,6 +2885,7 @@ def _render_swing_trading(
     col_o3.metric("Event Risk", event_context.event_risk)
     col_o4.metric("Catalyst", event_context.catalyst_status)
     st.info(_swing_overlay_read(swing_result, regime_persistence, options_context, event_context))
+    _render_swing_volatility_card(swing_result.volatility_context)
 
     st.subheader("Swing Signal Cards")
     if swing_result.signals:
@@ -2276,10 +2912,36 @@ def _render_swing_trading(
         with chart3:
             st.plotly_chart(_swing_sector_strength_chart(swing_result.swing_frame, ticker), width="stretch", key=f"swing_sector_{ticker}_{benchmark}")
         with chart4:
-            st.plotly_chart(_swing_atr_chart(swing_result.swing_frame), width="stretch", key=f"swing_atr_{ticker}_{benchmark}")
+            st.plotly_chart(_swing_atr_chart(swing_result.swing_frame, swing_result.volatility_context), width="stretch", key=f"swing_atr_{ticker}_{benchmark}")
 
     st.subheader("Swing Recommendation Explanation")
     st.write(swing_result.explanation)
+
+
+def _render_swing_volatility_card(volatility_context: dict) -> None:
+    st.markdown("**Swing Volatility**")
+    if not volatility_context.get("available"):
+        st.info(volatility_context.get("interpretation", "Swing volatility is unavailable."))
+        for warning in volatility_context.get("warnings", []):
+            st.warning(warning)
+        return
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Status", volatility_context.get("volatility_status", "Unavailable"))
+    col2.metric(f"ATR {volatility_context.get('atr_window', 14)}D", _format_optional_number(volatility_context.get("atr")))
+    col3.metric("ATR % Price", _format_optional_pct(volatility_context.get("atr_pct_price")))
+    col4.metric(
+        f"Realized Vol {volatility_context.get('realized_vol_window', 20)}D",
+        _format_optional_pct(volatility_context.get("realized_vol")),
+    )
+    col5.metric("2x ATR Stop Context", _format_optional_pct(volatility_context.get("suggested_stop_distance")))
+    st.caption(
+        f"Preset: {volatility_context.get('timeframe_preset', DEFAULT_TIMEFRAME_PRESET)}. "
+        "Volatility affects sizing, stop distance, and confidence; it is not a bullish/bearish direction signal."
+    )
+    st.info(volatility_context.get("interpretation", "Swing volatility context is unavailable."))
+    for warning in volatility_context.get("warnings", []):
+        st.warning(warning)
 
 
 def _render_swing_card(signal) -> None:
@@ -2672,12 +3334,17 @@ def _price_volume_chart(scored: pd.DataFrame, ticker: str) -> go.Figure:
 
 def _relative_volume_chart(scored: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
-    if "RVOL 20D" in scored.columns:
+    rvol_column = "RVOL Medium" if "RVOL Medium" in scored.columns else "RVOL 20D"
+    medium_window = None
+    if "Volume Medium Window" in scored.columns and not scored["Volume Medium Window"].dropna().empty:
+        medium_window = int(scored["Volume Medium Window"].dropna().iloc[-1])
+    label = f"RVOL {medium_window}D" if medium_window else rvol_column
+    if rvol_column in scored.columns:
         fig.add_trace(
             go.Scatter(
                 x=scored.index,
-                y=scored["RVOL 20D"],
-                name="RVOL 20D",
+                y=scored[rvol_column],
+                name=label,
                 line=dict(color="#22c55e", width=2),
             )
         )
@@ -2743,6 +3410,80 @@ def _relative_ratio_chart(history: pd.DataFrame, relative_context: dict) -> go.F
         )
     )
     return _finish_chart(fig, title="Relative Strength Ratio")
+
+
+def _relative_strength_quality_chart(clean_relative_trend: dict) -> go.Figure:
+    fig = go.Figure()
+    history = clean_relative_trend.get("history")
+    if history is None or history.empty or "Relative Ratio" not in history.columns:
+        fig.add_annotation(text="Not enough data available.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        return _finish_chart(fig, title="Relative Strength Quality")
+
+    fig.add_trace(
+        go.Scatter(
+            x=history.index,
+            y=history["Relative Ratio"],
+            name="Ticker / Benchmark ratio",
+            line=dict(color="#38bdf8", width=2.6),
+        )
+    )
+    if "Relative Ratio MA" in history.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=history.index,
+                y=history["Relative Ratio MA"],
+                name="Relative ratio average",
+                line=dict(color="#f59e0b", width=2.1, dash="dash"),
+            )
+        )
+    if "Rolling Correlation" in history.columns and history["Rolling Correlation"].notna().any():
+        fig.add_trace(
+            go.Scatter(
+                x=history.index,
+                y=history["Rolling Correlation"],
+                name="Rolling correlation",
+                line=dict(color="#a78bfa", width=1.8, dash="dot"),
+                yaxis="y2",
+            )
+        )
+        fig.update_layout(
+            yaxis2=dict(
+                title="Correlation",
+                overlaying="y",
+                side="right",
+                range=[-1, 1],
+                showgrid=False,
+                tickfont=dict(color="#c4b5fd"),
+                titlefont=dict(color="#c4b5fd"),
+            )
+        )
+    details = clean_relative_trend.get("details", {})
+    stability = details.get("relationship_stability", {})
+    volume = details.get("volume_confirmation", {})
+    note = (
+        f"Stability: {clean_relative_trend.get('relationship_stability_score', 0)}/"
+        f"{clean_relative_trend.get('relationship_stability_max', 30)}"
+    )
+    corr_short = stability.get("corr_short")
+    if corr_short is not None:
+        note += f" | Corr: {corr_short:.2f}"
+    volume_context = volume.get("context")
+    if volume_context:
+        note += f" | Volume: {volume_context}"
+    fig.add_annotation(
+        text=note,
+        x=0.01,
+        y=0.98,
+        xref="paper",
+        yref="paper",
+        showarrow=False,
+        align="left",
+        font=dict(color="#cbd5e1", size=12),
+        bgcolor="rgba(15, 23, 42, 0.72)",
+        bordercolor="rgba(148, 163, 184, 0.26)",
+        borderpad=6,
+    )
+    return _finish_chart(fig, title="Relative Strength Quality")
 
 
 def _relative_zscore_chart(history: pd.DataFrame) -> go.Figure:
@@ -3402,10 +4143,14 @@ def _swing_sector_strength_chart(frame: pd.DataFrame, ticker: str) -> go.Figure:
     return _finish_chart(fig, title="Ticker vs Sector Relative Strength")
 
 
-def _swing_atr_chart(frame: pd.DataFrame) -> go.Figure:
+def _swing_atr_chart(frame: pd.DataFrame, volatility_context: dict | None = None) -> go.Figure:
+    volatility_context = volatility_context or {}
+    atr_window = int(volatility_context.get("atr_window", 14) or 14)
+    realized_window = int(volatility_context.get("realized_vol_window", 20) or 20)
+    realized_column = "Realized Volatility" if "Realized Volatility" in frame.columns else "20D Realized Volatility"
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=frame.index, y=frame["ATR %"], name="14D ATR %", line=dict(color="#b83232", width=2)))
-    fig.add_trace(go.Scatter(x=frame.index, y=frame["20D Realized Volatility"], name="20D realized volatility", line=dict(color="#737373", width=2)))
+    fig.add_trace(go.Scatter(x=frame.index, y=frame["ATR %"], name=f"{atr_window}D ATR %", line=dict(color="#b83232", width=2)))
+    fig.add_trace(go.Scatter(x=frame.index, y=frame[realized_column], name=f"{realized_window}D realized volatility", line=dict(color="#737373", width=2)))
     fig.update_yaxes(tickformat=".1%")
     return _finish_chart(fig, title="ATR and Realized Volatility")
 
@@ -3492,12 +4237,32 @@ def _format_optional_decimal(value) -> str:
     return f"{float(value):.1f}"
 
 
+def _float_turnover_summary(latest: pd.Series, timeframe_config: dict) -> str:
+    parts = []
+    for window in timeframe_config.get("float_turnover_windows", []):
+        label = "Daily" if int(window) == 1 else f"{int(window)}D"
+        column = "Daily Float Turnover" if int(window) == 1 else f"{int(window)}D Float Turnover"
+        value = latest.get(column)
+        if pd.isna(value):
+            continue
+        parts.append(f"{label}: {float(value):.1%}")
+    return " / ".join(parts) if parts else "Float turnover unavailable"
+
+
 def _volume_status_class(context: str) -> str:
     if context in {"Accumulation", "Breakout Confirmation"}:
         return "positive"
     if context in {"Distribution", "Panic / Liquidation", "Weak Participation", "Unavailable"}:
         return "warning"
     return "mixed"
+
+
+def _trend_quality_status_class(score: int) -> str:
+    if score >= 80:
+        return "positive"
+    if score >= 60:
+        return "mixed"
+    return "warning"
 
 
 def _filter_scored_by_timeframe(scored: pd.DataFrame, timeframe_label: str) -> pd.DataFrame:
@@ -3509,8 +4274,12 @@ def _filter_scored_by_timeframe(scored: pd.DataFrame, timeframe_label: str) -> p
         "5D": 5,
         "10D": 10,
         "1M": 21,
+        "2M": 42,
         "3M": 63,
+        "4M": 84,
         "6M": 126,
+        "8M": 168,
+        "10M": 210,
         "1Y": 252,
         "3Y": 756,
         "5Y": 1260,
@@ -3534,7 +4303,7 @@ def _filter_scored_by_timeframe(scored: pd.DataFrame, timeframe_label: str) -> p
     return scored
 
 
-RETURN_COLUMNS = ["5D", "10D", "1M", "3M", "QTD", "YTD", "6M", "1Y"]
+RETURN_COLUMNS = ["5D", "10D", "1M", "2M", "3M", "4M", "6M", "8M", "10M", "YTD", "1Y"]
 
 
 def _format_performance_table(table: pd.DataFrame) -> pd.DataFrame:
@@ -3547,7 +4316,7 @@ def _format_performance_table(table: pd.DataFrame) -> pd.DataFrame:
 
 def _display_performance_table(table: pd.DataFrame) -> pd.DataFrame:
     display = _apply_display_type(table)
-    preferred_columns = ["Type", "Ticker", "5D", "10D", "1M", "3M", "QTD", "YTD", "6M", "1Y"]
+    preferred_columns = ["Type", "Ticker", "5D", "10D", "1M", "2M", "3M", "4M", "6M", "8M", "10M", "YTD", "1Y"]
     return display[[column for column in preferred_columns if column in display.columns]]
 
 
@@ -3644,6 +4413,39 @@ def _render_styles() -> None:
         .scope-badge strong {
             color: #99f6e4;
             font-weight: 850;
+        }
+        .chart-note {
+            border: 1px solid rgba(56, 189, 248, 0.20);
+            border-radius: 8px;
+            padding: 0.68rem 0.82rem;
+            margin: 0.2rem 0 0.9rem;
+            background: rgba(15, 23, 42, 0.48);
+            color: #cbd5e1;
+            font-size: 0.86rem;
+            line-height: 1.45;
+        }
+        .chart-note strong {
+            color: #bae6fd;
+        }
+        .trend-quality-card {
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            border-radius: 8px;
+            padding: 0.95rem 1rem;
+            margin: 0.25rem 0 0.85rem;
+            background: rgba(15, 23, 42, 0.54);
+            color: #dbeafe;
+        }
+        .trend-quality-card.signal-positive {
+            border-color: rgba(34, 197, 94, 0.34);
+            background: rgba(20, 83, 45, 0.20);
+        }
+        .trend-quality-card.signal-mixed {
+            border-color: rgba(245, 158, 11, 0.34);
+            background: rgba(113, 63, 18, 0.18);
+        }
+        .trend-quality-card.signal-warning {
+            border-color: rgba(248, 113, 113, 0.34);
+            background: rgba(127, 29, 29, 0.18);
         }
         div[data-testid="stTabs"] div[role="tablist"],
         div[data-testid="stTabs"] div[data-baseweb="tab-list"] {

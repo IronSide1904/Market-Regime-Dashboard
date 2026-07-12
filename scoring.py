@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from config import REGIME_RULES, SEARCHABLE_SIGNAL_WEIGHTS
+from config import DEFAULT_TIMEFRAME_PRESET, REGIME_RULES, SEARCHABLE_SIGNAL_WEIGHTS
 from volume import classify_volume_history
 
 
@@ -49,6 +49,7 @@ def score_history(
     indicators: pd.DataFrame,
     ticker_ohlcv: pd.DataFrame | None = None,
     shares_float: float | None = None,
+    volume_timeframe_config: dict | None = None,
 ) -> pd.DataFrame:
     scored = indicators.copy()
     weights = SEARCHABLE_SIGNAL_WEIGHTS
@@ -90,11 +91,24 @@ def score_history(
     ]
     scored["MR-1 Core Score"] = scored[score_columns].sum(axis=1).round().astype(int)
 
-    volume_history = _volume_history(scored, ticker_ohlcv=ticker_ohlcv, shares_float=shares_float)
+    volume_history = _volume_history(
+        scored,
+        ticker_ohlcv=ticker_ohlcv,
+        shares_float=shares_float,
+        volume_timeframe_config=volume_timeframe_config,
+    )
     if volume_history.empty:
         scored["Volume Context"] = "Unavailable"
         scored["Volume Status"] = "Volume unavailable"
         scored["Volume Adjustment"] = 0
+        scored["Volume Timeframe Preset"] = DEFAULT_TIMEFRAME_PRESET
+        scored["Volume Short Window"] = np.nan
+        scored["Volume Medium Window"] = np.nan
+        scored["Volume Long Window"] = np.nan
+        scored["Volume Percentile Window"] = np.nan
+        scored["RVOL Short"] = np.nan
+        scored["RVOL Medium"] = np.nan
+        scored["RVOL Long"] = np.nan
         scored["RVOL 20D"] = np.nan
         scored["RVOL 50D"] = np.nan
         scored["Volume Percentile 1Y"] = np.nan
@@ -125,6 +139,7 @@ def _volume_history(
     scored: pd.DataFrame,
     ticker_ohlcv: pd.DataFrame | None,
     shares_float: float | None,
+    volume_timeframe_config: dict | None,
 ) -> pd.DataFrame:
     if ticker_ohlcv is None or ticker_ohlcv.empty:
         return pd.DataFrame()
@@ -132,7 +147,8 @@ def _volume_history(
     price_df = ticker_ohlcv.copy()
     if "Close" not in price_df.columns:
         price_df["Close"] = scored["Ticker Close"].reindex(price_df.index)
-    price_df["SMA 50D"] = price_df["Close"].rolling(50).mean()
+    trend_window = int((volume_timeframe_config or {}).get("trend_window", 50))
+    price_df["SMA 50D"] = price_df["Close"].rolling(trend_window).mean()
     price_df["SMA 200D"] = price_df["Close"].rolling(200).mean()
 
     trend_status = price_df["Close"] > price_df["SMA 200D"]
@@ -142,7 +158,25 @@ def _volume_history(
         trend_status=trend_status,
         vix_status=vix_status,
         shares_float=shares_float,
+        timeframe_config=volume_timeframe_config,
     )
+
+
+def apply_volume_context_adjustment(base_score: float, volume_context: dict) -> float:
+    try:
+        adjustment = int(volume_context.get("volume_adjustment", volume_context.get("adjustment", 0)))
+    except (TypeError, ValueError, AttributeError):
+        adjustment = 0
+    adjustment = max(-15, min(15, adjustment))
+    return float(np.clip(float(base_score) + adjustment, 0, 100))
+
+
+def apply_swing_volatility_adjustment(base_score: float, volatility_context: dict) -> float:
+    if not volatility_context or not volatility_context.get("available"):
+        return float(base_score)
+    status = str(volatility_context.get("volatility_status", "Normal"))
+    adjustment = -5 if status == "Extreme" else -2 if status == "Elevated" else 0
+    return float(np.clip(float(base_score) + adjustment, 0, 100))
 
 
 def latest_signal_breakdown(scored: pd.DataFrame, ticker: str, benchmark: str) -> list[SignalResult]:

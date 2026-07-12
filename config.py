@@ -32,6 +32,42 @@ RELATIVE_CONTEXT_CONFIG = {
     "min_score_adjustment": -10,
 }
 
+RELATIVE_TREND_QUALITY_CONFIG = {
+    "enabled": True,
+    "weights": {
+        "relative_trend_strength": 40,
+        "relationship_stability": 30,
+        "volume_confirmation": 30,
+    },
+    "labels": {
+        "clean": 80,
+        "good_but_watch": 60,
+        "mixed": 40,
+    },
+    "corr_thresholds": {
+        "strong": 0.50,
+        "moderate": 0.30,
+        "max_correlation_change": 0.25,
+    },
+    "show_in_overview": True,
+    "show_in_recommendation": True,
+    "show_in_swing_tab": True,
+}
+
+RELATIVE_TREND_TIMEFRAME_WINDOWS = {
+    "5D": {"rs_lookback": 5, "rs_ma": 5, "corr_short": 5, "corr_long": 20},
+    "10D": {"rs_lookback": 10, "rs_ma": 10, "corr_short": 10, "corr_long": 30},
+    "1M": {"rs_lookback": 21, "rs_ma": 20, "corr_short": 20, "corr_long": 60},
+    "2M": {"rs_lookback": 42, "rs_ma": 30, "corr_short": 25, "corr_long": 75},
+    "3M": {"rs_lookback": 63, "rs_ma": 50, "corr_short": 30, "corr_long": 90},
+    "4M": {"rs_lookback": 84, "rs_ma": 75, "corr_short": 45, "corr_long": 105},
+    "6M": {"rs_lookback": 126, "rs_ma": 100, "corr_short": 60, "corr_long": 126},
+    "8M": {"rs_lookback": 168, "rs_ma": 150, "corr_short": 75, "corr_long": 168},
+    "10M": {"rs_lookback": 210, "rs_ma": 180, "corr_short": 90, "corr_long": 210},
+    "YTD": {"rs_lookback": 126, "rs_ma": 100, "corr_short": 60, "corr_long": 126},
+    "1Y": {"rs_lookback": 252, "rs_ma": 200, "corr_short": 90, "corr_long": 252},
+}
+
 SECTOR_ETF_MAP = {
     "Technology": "XLK",
     "Communication Services": "XLC",
@@ -46,22 +82,20 @@ SECTOR_ETF_MAP = {
     "Basic Materials": "XLB",
 }
 
-TIMEFRAMES = {
-    "5D": "3y",
-    "10D": "3y",
-    "1M": "3y",
-    "3M": "3y",
-    "QTD": "3y",
-    "YTD": "3y",
-    "6M": "3y",
-    "1Y": "3y",
-    "3Y": "3y",
-    "5Y": "5y",
-}
+COMMON_TIMEFRAME_OPTIONS = ["5D", "10D", "1M", "2M", "3M", "4M", "6M", "8M", "10M", "YTD", "1Y"]
 
-SWING_TIMEFRAMES = ["5D", "10D", "1M", "3M", "QTD", "YTD", "6M", "1Y"]
+TIMEFRAMES = {label: "3y" for label in COMMON_TIMEFRAME_OPTIONS}
+
+SWING_TIMEFRAMES = COMMON_TIMEFRAME_OPTIONS
 
 SENSITIVITY_LOOKBACKS = {
+    "Very Conservative": {
+        "trend": 240,
+        "vix": 70,
+        "relative_strength": 70,
+        "breadth": 70,
+        "leadership": 70,
+    },
     "Conservative": {
         "trend": 220,
         "vix": 60,
@@ -83,7 +117,254 @@ SENSITIVITY_LOOKBACKS = {
         "breadth": 40,
         "leadership": 40,
     },
+    "Very Aggressive": {
+        "trend": 120,
+        "vix": 25,
+        "relative_strength": 25,
+        "breadth": 25,
+        "leadership": 25,
+    },
 }
+
+TIMEFRAME_SCORE_PROFILES = {
+    "5D": {
+        "scope": "Tactical",
+        "description": "Fastest MR-1 read for short tactical risk shifts.",
+        "lookbacks": {"trend": 35, "vix": 10, "relative_strength": 10, "breadth": 10, "leadership": 10},
+    },
+    "10D": {
+        "scope": "Tactical",
+        "description": "Fast MR-1 read for near-term tactical positioning.",
+        "lookbacks": {"trend": 45, "vix": 14, "relative_strength": 14, "breadth": 14, "leadership": 14},
+    },
+    "1M": {
+        "scope": "Swing",
+        "description": "Medium-fast MR-1 read for swing-trading conditions.",
+        "lookbacks": {"trend": 60, "vix": 20, "relative_strength": 20, "breadth": 20, "leadership": 20},
+    },
+    "2M": {
+        "scope": "Swing",
+        "description": "Two-month swing read with a little more smoothing than 1M.",
+        "lookbacks": {"trend": 75, "vix": 25, "relative_strength": 25, "breadth": 25, "leadership": 25},
+    },
+    "3M": {
+        "scope": "Swing",
+        "description": "Balanced swing horizon with less noise than the 1M read.",
+        "lookbacks": {"trend": 90, "vix": 30, "relative_strength": 30, "breadth": 30, "leadership": 30},
+    },
+    "4M": {
+        "scope": "Position",
+        "description": "Early position read bridging swing and slower allocation horizons.",
+        "lookbacks": {"trend": 115, "vix": 38, "relative_strength": 38, "breadth": 38, "leadership": 38},
+    },
+    "QTD": {
+        "scope": "Position",
+        "description": "Position-style MR-1 read focused on the current quarter.",
+        "lookbacks": {"trend": 120, "vix": 40, "relative_strength": 40, "breadth": 40, "leadership": 40},
+    },
+    "YTD": {
+        "scope": "Position",
+        "description": "Position-style MR-1 read for year-to-date risk conditions.",
+        "lookbacks": {"trend": 150, "vix": 45, "relative_strength": 45, "breadth": 45, "leadership": 45},
+    },
+    "6M": {
+        "scope": "Position",
+        "description": "Position-style MR-1 read with medium-slow smoothing.",
+        "lookbacks": {"trend": 170, "vix": 50, "relative_strength": 50, "breadth": 50, "leadership": 50},
+    },
+    "8M": {
+        "scope": "Position",
+        "description": "Longer position read with slower confirmation windows.",
+        "lookbacks": {"trend": 180, "vix": 52, "relative_strength": 52, "breadth": 52, "leadership": 52},
+    },
+    "10M": {
+        "scope": "Position",
+        "description": "Slow position read close to annual allocation context.",
+        "lookbacks": {"trend": 185, "vix": 54, "relative_strength": 54, "breadth": 54, "leadership": 54},
+    },
+    "1Y": {
+        "scope": "Position",
+        "description": "Slow position horizon for broader risk allocation.",
+        "lookbacks": {"trend": 190, "vix": 55, "relative_strength": 55, "breadth": 55, "leadership": 55},
+    },
+    "3Y": {
+        "scope": "Strategic",
+        "description": "Classic MR-1 style strategic regime read.",
+        "lookbacks": {"trend": 200, "vix": 50, "relative_strength": 50, "breadth": 50, "leadership": 50},
+    },
+    "5Y": {
+        "scope": "Strategic",
+        "description": "Slowest strategic regime read for long-history context.",
+        "lookbacks": {"trend": 220, "vix": 60, "relative_strength": 60, "breadth": 60, "leadership": 60},
+    },
+}
+
+SENSITIVITY_FACTORS = {
+    "Very Conservative": 1.25,
+    "Conservative": 1.12,
+    "Balanced": 1.0,
+    "Aggressive": 0.8,
+    "Very Aggressive": 0.65,
+}
+
+SWING_SCORE_PROFILES = {
+    "5D": {
+        "scope": "Tactical",
+        "description": "Short tactical swing score emphasizing 5D/10D momentum and near-term risk.",
+        "relative_windows": ["5D", "10D"],
+        "support_windows": ["5D", "10D"],
+        "peer_windows": ["5D", "10D"],
+        "trend_checks": [("20D SMA", 12), ("50D SMA", 4)],
+        "stack_checks": [("20D SMA", "50D SMA", 4)],
+        "atr_clean": 0.035,
+        "atr_warning": 0.06,
+    },
+    "10D": {
+        "scope": "Tactical",
+        "description": "Fast tactical swing score using 10D/1M confirmation.",
+        "relative_windows": ["10D", "1M"],
+        "support_windows": ["10D", "1M"],
+        "peer_windows": ["10D", "1M"],
+        "trend_checks": [("20D SMA", 10), ("50D SMA", 6)],
+        "stack_checks": [("20D SMA", "50D SMA", 4)],
+        "atr_clean": 0.04,
+        "atr_warning": 0.065,
+    },
+    "1M": {
+        "scope": "Swing",
+        "description": "Standard swing score using 1M/3M relative strength.",
+        "relative_windows": ["1M", "3M"],
+        "support_windows": ["1M", "3M", "QTD"],
+        "peer_windows": ["1M", "3M", "QTD"],
+        "trend_checks": [("20D SMA", 8), ("50D SMA", 8)],
+        "stack_checks": [("20D SMA", "50D SMA", 4)],
+        "atr_clean": 0.04,
+        "atr_warning": 0.07,
+    },
+    "2M": {
+        "scope": "Swing",
+        "description": "Two-month swing score using 1M/2M/3M confirmation.",
+        "relative_windows": ["1M", "2M", "3M"],
+        "support_windows": ["1M", "2M", "3M"],
+        "peer_windows": ["1M", "2M", "3M"],
+        "trend_checks": [("20D SMA", 6), ("50D SMA", 10)],
+        "stack_checks": [("20D SMA", "50D SMA", 4)],
+        "atr_clean": 0.043,
+        "atr_warning": 0.073,
+    },
+    "3M": {
+        "scope": "Swing",
+        "description": "Normal swing score with more 3M/QTD confirmation.",
+        "relative_windows": ["1M", "3M", "QTD"],
+        "support_windows": ["1M", "3M", "QTD"],
+        "peer_windows": ["1M", "3M", "QTD"],
+        "trend_checks": [("50D SMA", 10), ("200D SMA", 6)],
+        "stack_checks": [("20D SMA", "50D SMA", 4)],
+        "atr_clean": 0.045,
+        "atr_warning": 0.075,
+    },
+    "4M": {
+        "scope": "Position",
+        "description": "Four-month score emphasizing 3M/4M leadership and trend support.",
+        "relative_windows": ["3M", "4M", "6M"],
+        "support_windows": ["3M", "4M", "6M"],
+        "peer_windows": ["3M", "4M", "6M"],
+        "trend_checks": [("50D SMA", 10), ("200D SMA", 6)],
+        "stack_checks": [("50D SMA", "200D SMA", 4)],
+        "atr_clean": 0.05,
+        "atr_warning": 0.08,
+    },
+    "QTD": {
+        "scope": "Position",
+        "description": "Current-quarter position score emphasizing QTD and 3M leadership.",
+        "relative_windows": ["3M", "QTD"],
+        "support_windows": ["3M", "QTD", "6M"],
+        "peer_windows": ["3M", "QTD", "6M"],
+        "trend_checks": [("50D SMA", 8), ("200D SMA", 8)],
+        "stack_checks": [("50D SMA", "200D SMA", 4)],
+        "atr_clean": 0.05,
+        "atr_warning": 0.08,
+    },
+    "YTD": {
+        "scope": "Position",
+        "description": "Position score focused on YTD and 6M trend quality.",
+        "relative_windows": ["YTD", "6M"],
+        "support_windows": ["YTD", "6M", "1Y"],
+        "peer_windows": ["YTD", "6M", "1Y"],
+        "trend_checks": [("50D SMA", 6), ("200D SMA", 10)],
+        "stack_checks": [("50D SMA", "200D SMA", 4)],
+        "atr_clean": 0.055,
+        "atr_warning": 0.085,
+    },
+    "6M": {
+        "scope": "Position",
+        "description": "Position score emphasizing 6M and 1Y relative strength.",
+        "relative_windows": ["6M", "1Y"],
+        "support_windows": ["3M", "6M", "1Y"],
+        "peer_windows": ["3M", "6M", "1Y"],
+        "trend_checks": [("50D SMA", 6), ("200D SMA", 10)],
+        "stack_checks": [("50D SMA", "200D SMA", 4)],
+        "atr_clean": 0.055,
+        "atr_warning": 0.085,
+    },
+    "8M": {
+        "scope": "Position",
+        "description": "Eight-month position score emphasizing 6M/8M/1Y trend quality.",
+        "relative_windows": ["6M", "8M", "1Y"],
+        "support_windows": ["6M", "8M", "1Y"],
+        "peer_windows": ["6M", "8M", "1Y"],
+        "trend_checks": [("50D SMA", 4), ("200D SMA", 12)],
+        "stack_checks": [("50D SMA", "200D SMA", 4)],
+        "atr_clean": 0.058,
+        "atr_warning": 0.088,
+    },
+    "10M": {
+        "scope": "Position",
+        "description": "Ten-month position score focused on broad trend and relative leadership.",
+        "relative_windows": ["8M", "10M", "1Y"],
+        "support_windows": ["8M", "10M", "1Y"],
+        "peer_windows": ["8M", "10M", "1Y"],
+        "trend_checks": [("200D SMA", 14)],
+        "stack_checks": [("50D SMA", "200D SMA", 4)],
+        "atr_clean": 0.06,
+        "atr_warning": 0.09,
+    },
+    "1Y": {
+        "scope": "Position",
+        "description": "Slow swing/position score with broad trend and 1Y leadership emphasis.",
+        "relative_windows": ["6M", "1Y"],
+        "support_windows": ["6M", "1Y", "YTD"],
+        "peer_windows": ["6M", "1Y", "YTD"],
+        "trend_checks": [("200D SMA", 16)],
+        "stack_checks": [("50D SMA", "200D SMA", 4)],
+        "atr_clean": 0.06,
+        "atr_warning": 0.09,
+    },
+}
+
+
+def get_timeframe_score_profile(timeframe_label: str, sensitivity: str) -> dict:
+    profile = TIMEFRAME_SCORE_PROFILES.get(timeframe_label, TIMEFRAME_SCORE_PROFILES["3Y"])
+    factor = SENSITIVITY_FACTORS.get(sensitivity, SENSITIVITY_FACTORS["Balanced"])
+    lookbacks = {
+        key: max(5, int(round(value * factor)))
+        for key, value in profile["lookbacks"].items()
+    }
+    return {
+        "timeframe": timeframe_label,
+        "sensitivity": sensitivity,
+        "scope": profile["scope"],
+        "description": profile["description"],
+        "lookbacks": lookbacks,
+    }
+
+
+def get_swing_timeframe_profile(swing_timeframe: str) -> dict:
+    profile = SWING_SCORE_PROFILES.get(swing_timeframe, SWING_SCORE_PROFILES["1M"])
+    return {
+        "timeframe": swing_timeframe,
+        **profile,
+    }
 
 MIN_TRADING_DAYS = 252
 
@@ -104,6 +385,159 @@ VOLUME_CONFIG = {
     "sharp_down_day_pct": -2.0,
     "max_positive_adjustment": 15,
     "max_negative_adjustment": -15,
+}
+
+TIMEFRAME_PRESETS = {
+    "5D": {
+        "description": "Fast tactical setup using short volume and volatility windows.",
+        "volume_short_window": 5,
+        "volume_medium_window": 10,
+        "volume_long_window": 20,
+        "volume_percentile_window": 63,
+        "float_turnover_windows": [1, 5, 10],
+        "atr_window": 10,
+        "realized_vol_window": 10,
+        "trend_window": 20,
+    },
+    "10D": {
+        "description": "Fast tactical setup using short volume and volatility windows.",
+        "volume_short_window": 5,
+        "volume_medium_window": 10,
+        "volume_long_window": 20,
+        "volume_percentile_window": 63,
+        "float_turnover_windows": [1, 5, 10],
+        "atr_window": 10,
+        "realized_vol_window": 10,
+        "trend_window": 20,
+    },
+    "1M": {
+        "description": "Standard swing setup using medium volume and volatility windows.",
+        "volume_short_window": 10,
+        "volume_medium_window": 20,
+        "volume_long_window": 50,
+        "volume_percentile_window": 252,
+        "float_turnover_windows": [1, 5, 20],
+        "atr_window": 14,
+        "realized_vol_window": 20,
+        "trend_window": 50,
+    },
+    "2M": {
+        "description": "Two-month swing setup using medium volume and volatility windows.",
+        "volume_short_window": 10,
+        "volume_medium_window": 20,
+        "volume_long_window": 42,
+        "volume_percentile_window": 126,
+        "float_turnover_windows": [1, 10, 20],
+        "atr_window": 14,
+        "realized_vol_window": 20,
+        "trend_window": 50,
+    },
+    "3M": {
+        "description": "Standard swing setup using medium volume and volatility windows.",
+        "volume_short_window": 10,
+        "volume_medium_window": 20,
+        "volume_long_window": 50,
+        "volume_percentile_window": 252,
+        "float_turnover_windows": [1, 5, 20],
+        "atr_window": 14,
+        "realized_vol_window": 20,
+        "trend_window": 50,
+    },
+    "4M": {
+        "description": "Four-month setup bridging swing and position windows.",
+        "volume_short_window": 14,
+        "volume_medium_window": 30,
+        "volume_long_window": 84,
+        "volume_percentile_window": 168,
+        "float_turnover_windows": [1, 20, 40],
+        "atr_window": 18,
+        "realized_vol_window": 25,
+        "trend_window": 75,
+    },
+    "6M": {
+        "description": "Position-style setup using slower volume and volatility windows.",
+        "volume_short_window": 20,
+        "volume_medium_window": 50,
+        "volume_long_window": 63,
+        "volume_percentile_window": 252,
+        "float_turnover_windows": [1, 20, 50],
+        "atr_window": 21,
+        "realized_vol_window": 30,
+        "trend_window": 100,
+    },
+    "8M": {
+        "description": "Eight-month position setup using broad confirmation windows.",
+        "volume_short_window": 20,
+        "volume_medium_window": 63,
+        "volume_long_window": 84,
+        "volume_percentile_window": 252,
+        "float_turnover_windows": [1, 20, 63],
+        "atr_window": 21,
+        "realized_vol_window": 42,
+        "trend_window": 120,
+    },
+    "10M": {
+        "description": "Ten-month position setup using slow confirmation windows.",
+        "volume_short_window": 21,
+        "volume_medium_window": 63,
+        "volume_long_window": 105,
+        "volume_percentile_window": 252,
+        "float_turnover_windows": [1, 21, 63],
+        "atr_window": 21,
+        "realized_vol_window": 50,
+        "trend_window": 150,
+    },
+    "YTD": {
+        "description": "Year-to-date setup using position-style volume and volatility windows.",
+        "volume_short_window": 20,
+        "volume_medium_window": 50,
+        "volume_long_window": 63,
+        "volume_percentile_window": 252,
+        "float_turnover_windows": [1, 20, 50],
+        "atr_window": 21,
+        "realized_vol_window": 30,
+        "trend_window": 100,
+    },
+    "1Y": {
+        "description": "Position-style setup using slower volume and volatility windows.",
+        "volume_short_window": 20,
+        "volume_medium_window": 50,
+        "volume_long_window": 63,
+        "volume_percentile_window": 252,
+        "float_turnover_windows": [1, 20, 50],
+        "atr_window": 21,
+        "realized_vol_window": 30,
+        "trend_window": 100,
+    },
+}
+
+DEFAULT_TIMEFRAME_PRESET = "1M"
+
+TIMEFRAME_TO_VOLUME_PRESET = {label: label for label in COMMON_TIMEFRAME_OPTIONS}
+
+SWING_TIMEFRAME_TO_VOLATILITY_PRESET = {label: label for label in COMMON_TIMEFRAME_OPTIONS}
+
+CUSTOM_TIMEFRAME_LIMITS = {
+    "min_volume_window": 5,
+    "max_volume_window": 252,
+    "min_atr_window": 5,
+    "max_atr_window": 63,
+    "min_realized_vol_window": 5,
+    "max_realized_vol_window": 126,
+}
+
+VOLUME_CONTEXT_CONFIG = {
+    "enabled": True,
+    "use_timeframe_presets": True,
+    "default_preset": DEFAULT_TIMEFRAME_PRESET,
+    "show_advanced_controls": False,
+}
+
+SWING_VOLATILITY_CONFIG = {
+    "enabled": True,
+    "use_timeframe_presets": True,
+    "default_preset": DEFAULT_TIMEFRAME_PRESET,
+    "annualize_realized_vol": True,
 }
 
 MANUAL_FLOAT_SHARES = {

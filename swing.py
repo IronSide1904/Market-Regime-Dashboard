@@ -6,8 +6,10 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from config import DEFAULT_TIMEFRAME_PRESET, get_swing_timeframe_profile
 from metadata import AssetContext
 from performance import calculate_performance_rows, calculate_returns
+from volatility import calculate_atr, calculate_realized_volatility, calculate_swing_volatility_context
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,10 @@ class SwingResult:
     close: pd.DataFrame
     warnings: list[str]
     explanation: str
+    score_scope: str
+    score_horizon: str
+    signal_summary: str
+    volatility_context: dict
 
 
 def build_swing_result(
@@ -42,16 +48,25 @@ def build_swing_result(
     benchmark: str,
     context: AssetContext,
     market_regime: str,
+    swing_timeframe: str = "1M",
+    volatility_timeframe_config: dict | None = None,
 ) -> SwingResult:
+    profile = get_swing_timeframe_profile(swing_timeframe)
     assets = _asset_list(ticker=ticker, benchmark=benchmark, context=context)
     ohlc = _download_ohlc(assets, period="2y")
     warnings: list[str] = []
 
     if ohlc.empty or ticker not in ohlc.get("Close", pd.DataFrame()).columns:
-        return _empty_result(ticker=ticker, warning="Swing data is unavailable for this ticker.")
+        return _empty_result(ticker=ticker, warning="Swing data is unavailable for this ticker.", profile=profile)
 
     close = ohlc["Close"].dropna(how="all")
-    frame = _calculate_swing_frame(ohlc=ohlc, ticker=ticker, benchmark=benchmark, context=context)
+    frame = _calculate_swing_frame(
+        ohlc=ohlc,
+        ticker=ticker,
+        benchmark=benchmark,
+        context=context,
+        volatility_timeframe_config=volatility_timeframe_config,
+    )
     performance_assets = [
         ("Selected ticker", ticker, "Ticker"),
         ("Benchmark", benchmark, benchmark),
@@ -64,11 +79,18 @@ def build_swing_result(
     performance_table = calculate_performance_rows(close=close, assets=performance_assets)
 
     if frame.empty:
-        return _empty_result(ticker=ticker, warning="Not enough swing data to calculate indicators.")
+        return _empty_result(ticker=ticker, warning="Not enough swing data to calculate indicators.", profile=profile)
 
+    ticker_ohlcv = _ticker_ohlcv(ohlc, ticker)
+    volatility_context = calculate_swing_volatility_context(ticker_ohlcv, timeframe_config=volatility_timeframe_config)
     latest = frame.iloc[-1]
     perf_by_ticker = _performance_by_ticker(close)
-    peer_rank, peer_count = _peer_rank(ticker=ticker, peers=context.peers, performance=perf_by_ticker)
+    peer_rank, peer_count = _peer_rank(
+        ticker=ticker,
+        peers=context.peers,
+        performance=perf_by_ticker,
+        windows=profile["peer_windows"],
+    )
     signals = _score_signals(
         ticker=ticker,
         benchmark=benchmark,
@@ -78,6 +100,7 @@ def build_swing_result(
         peer_rank=peer_rank,
         peer_count=peer_count,
         market_regime=market_regime,
+        profile=profile,
     )
     score = int(sum(signal.score for signal in signals if signal.contributes_to_score))
     setup_label = _setup_label(score)
@@ -87,7 +110,7 @@ def build_swing_result(
         market_regime=market_regime,
         latest=latest,
     )
-    exposure = _swing_exposure(action=action, latest=latest, market_regime=market_regime)
+    exposure = _swing_exposure(action=action, latest=latest, market_regime=market_regime, profile=profile)
     positive_driver, main_risk = _drivers(signals)
     explanation = _explanation(
         ticker=ticker,
@@ -98,6 +121,7 @@ def build_swing_result(
         latest=latest,
         positive_driver=positive_driver,
         main_risk=main_risk,
+        profile=profile,
     )
 
     return SwingResult(
@@ -113,6 +137,10 @@ def build_swing_result(
         close=close,
         warnings=warnings,
         explanation=explanation,
+        score_scope=profile["scope"],
+        score_horizon=profile["timeframe"],
+        signal_summary=_swing_signal_summary(profile),
+        volatility_context=volatility_context,
     )
 
 
@@ -157,6 +185,7 @@ def _calculate_swing_frame(
     ticker: str,
     benchmark: str,
     context: AssetContext,
+    volatility_timeframe_config: dict | None = None,
 ) -> pd.DataFrame:
     close = ohlc["Close"]
     high = ohlc["High"]
@@ -192,21 +221,32 @@ def _calculate_swing_frame(
     data["Industry 1M Return"] = data["Industry Close"].pct_change(21)
     data["Industry 3M Return"] = data["Industry Close"].pct_change(63)
 
-    true_range = pd.concat(
-        [
-            high[ticker] - low[ticker],
-            (high[ticker] - close[ticker].shift(1)).abs(),
-            (low[ticker] - close[ticker].shift(1)).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    data["14D ATR"] = true_range.rolling(14).mean()
-    data["ATR %"] = data["14D ATR"] / data["Ticker Close"]
-    data["20D Realized Volatility"] = close[ticker].pct_change().rolling(20).std() * np.sqrt(252)
+    volatility_timeframe_config = volatility_timeframe_config or {"atr_window": 14, "realized_vol_window": 20}
+    ticker_ohlcv = _ticker_ohlcv(ohlc, ticker)
+    atr_window = int(volatility_timeframe_config.get("atr_window", 14))
+    realized_vol_window = int(volatility_timeframe_config.get("realized_vol_window", 20))
+    data["ATR"] = calculate_atr(ticker_ohlcv, window=atr_window)
+    data[f"{atr_window}D ATR"] = data["ATR"]
+    data["ATR %"] = data["ATR"] / data["Ticker Close"]
+    data["Realized Volatility"] = calculate_realized_volatility(ticker_ohlcv, window=realized_vol_window, annualize=True)
+    data[f"{realized_vol_window}D Realized Volatility"] = data["Realized Volatility"]
+    data["14D ATR"] = data["ATR"]
+    data["20D Realized Volatility"] = data["Realized Volatility"]
     data["QTD Return"] = _rolling_period_return(close[ticker], period="quarter")
     data["YTD Return"] = _rolling_period_return(close[ticker], period="year")
 
     return data.dropna(subset=["Ticker Close", "20D SMA", "50D SMA", "200D SMA"])
+
+
+def _ticker_ohlcv(ohlc: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    fields = {}
+    for field in ["Open", "High", "Low", "Close"]:
+        try:
+            if field in ohlc and ticker in ohlc[field].columns:
+                fields[field] = ohlc[field][ticker]
+        except Exception:
+            continue
+    return pd.DataFrame(fields).dropna(how="all") if fields else pd.DataFrame()
 
 
 def _rolling_period_return(series: pd.Series, period: str) -> pd.Series:
@@ -239,12 +279,13 @@ def _peer_rank(
     ticker: str,
     peers: list[str],
     performance: dict[str, dict[str, float | None]],
+    windows: list[str],
 ) -> tuple[int | None, int]:
     tickers = [ticker, *peers]
     rows = []
     for asset in tickers:
         returns = performance.get(asset, {})
-        values = [returns.get(label) for label in ["1M", "3M", "QTD"]]
+        values = [returns.get(label) for label in windows]
         usable = [value for value in values if value is not None]
         if usable:
             rows.append((asset, sum(usable) / len(usable)))
@@ -265,29 +306,29 @@ def _score_signals(
     peer_rank: int | None,
     peer_count: int,
     market_regime: str,
+    profile: dict,
 ) -> list[SwingSignal]:
     trend_score = 0
-    if latest["Ticker Close"] > latest["20D SMA"]:
-        trend_score += 8
-    if latest["Ticker Close"] > latest["50D SMA"]:
-        trend_score += 8
-    if latest["20D SMA"] > latest["50D SMA"]:
-        trend_score += 4
+    for average_column, points in profile["trend_checks"]:
+        if pd.notna(latest.get(average_column)) and latest["Ticker Close"] > latest[average_column]:
+            trend_score += points
+    for short_column, long_column, points in profile["stack_checks"]:
+        if pd.notna(latest.get(short_column)) and pd.notna(latest.get(long_column)) and latest[short_column] > latest[long_column]:
+            trend_score += points
 
     ticker_perf = performance.get(ticker, {})
     benchmark_perf = performance.get(benchmark, {})
     rs_score = 0
-    if _beats(ticker_perf, benchmark_perf, "1M"):
-        rs_score += 10
-    if _beats(ticker_perf, benchmark_perf, "3M"):
-        rs_score += 10
+    for label, points in _weighted_windows(profile["relative_windows"], 20):
+        if _beats(ticker_perf, benchmark_perf, label):
+            rs_score += points
 
     market_score = {"Risk-On": 20, "Neutral": 12, "Defensive": 0}.get(market_regime, 0)
 
     sector_perf = performance.get(context.sector_etf, {})
     industry_perf = performance.get(context.industry_proxy, {})
     sector_score = 0
-    for label, points in [("1M", 6), ("3M", 7), ("QTD", 7)]:
+    for label, points in _weighted_windows(profile["support_windows"], 20):
         if _beats(sector_perf, benchmark_perf, label) or _positive(sector_perf, label):
             sector_score += points / 2
         if _beats(industry_perf, benchmark_perf, label) or _positive(industry_perf, label):
@@ -301,16 +342,22 @@ def _score_signals(
         peer_value = f"Rank {peer_rank} of {peer_count}"
 
     atr_pct = latest.get("ATR %", np.nan)
-    vol_score = 5 if pd.notna(atr_pct) and atr_pct <= 0.04 else 3 if pd.notna(atr_pct) and atr_pct <= 0.07 else 0
+    vol_score = (
+        5
+        if pd.notna(atr_pct) and atr_pct <= profile["atr_clean"]
+        else 3
+        if pd.notna(atr_pct) and atr_pct <= profile["atr_warning"]
+        else 0
+    )
 
     return [
         SwingSignal(
-            "20D / 50D Trend",
+            f"{profile['scope']} Trend",
             _status(trend_score, 20),
             int(trend_score),
             20,
-            f"Price {latest['Ticker Close']:.2f}; 20D {latest['20D SMA']:.2f}; 50D {latest['50D SMA']:.2f}",
-            "Strong when price is above both 20D and 50D averages and 20D is above 50D.",
+            f"Price {latest['Ticker Close']:.2f}; 20D {latest['20D SMA']:.2f}; 50D {latest['50D SMA']:.2f}; 200D {latest['200D SMA']:.2f}",
+            f"Trend checks are selected from the {profile['timeframe']} {profile['scope'].lower()} swing horizon.",
         ),
         SwingSignal(
             "1M Momentum",
@@ -345,7 +392,7 @@ def _score_signals(
             int(rs_score),
             20,
             f"{ticker}/{benchmark} ratio {latest['Ticker/Benchmark']:.2f}",
-            "Scores whether the ticker is outperforming the benchmark over 1M and 3M swing windows.",
+            f"Scores whether the ticker is outperforming the benchmark over {', '.join(profile['relative_windows'])} windows.",
         ),
         SwingSignal(
             "Market Regime",
@@ -361,7 +408,7 @@ def _score_signals(
             int(round(sector_score)),
             20,
             f"{context.sector_etf} / {context.industry_proxy}",
-            "Scores sector and industry strength across 1M, 3M, and QTD windows.",
+            f"Scores sector and industry strength across {', '.join(profile['support_windows'])} windows.",
         ),
         SwingSignal(
             "Peer Rank",
@@ -369,7 +416,7 @@ def _score_signals(
             int(peer_score),
             15,
             peer_value,
-            "Ranks the ticker against available peers over 1M, 3M, and QTD performance.",
+            f"Ranks the ticker against available peers over {', '.join(profile['peer_windows'])} performance.",
         ),
         SwingSignal(
             "ATR / Volatility Risk",
@@ -377,7 +424,7 @@ def _score_signals(
             int(vol_score),
             5,
             _format_pct(atr_pct),
-            "Lower ATR as a percent of price means the swing setup is cleaner and easier to size.",
+            f"Lower ATR is cleaner. This {profile['scope'].lower()} horizon treats <= {profile['atr_clean']:.1%} as clean.",
         ),
     ]
 
@@ -391,6 +438,13 @@ def _beats(left: dict[str, float | None], right: dict[str, float | None], label:
 def _positive(values: dict[str, float | None], label: str) -> bool:
     value = values.get(label)
     return value is not None and value > 0
+
+
+def _weighted_windows(windows: list[str], total_points: int) -> list[tuple[str, float]]:
+    if not windows:
+        return []
+    base = total_points / len(windows)
+    return [(window, base) for window in windows]
 
 
 def _momentum_card_score(values: dict[str, float | None], label: str) -> int:
@@ -440,7 +494,7 @@ def _swing_action(score: int, setup_label: str, market_regime: str, latest: pd.S
     return "AVOID"
 
 
-def _swing_exposure(action: str, latest: pd.Series, market_regime: str) -> float:
+def _swing_exposure(action: str, latest: pd.Series, market_regime: str, profile: dict | None = None) -> float:
     if action == "BUY / ADD":
         exposure = 1.0
     elif action == "BUY SMALL / HOLD":
@@ -452,7 +506,8 @@ def _swing_exposure(action: str, latest: pd.Series, market_regime: str) -> float
     else:
         exposure = 0.0
 
-    if pd.notna(latest.get("ATR %")) and latest["ATR %"] > 0.07:
+    atr_warning = float((profile or {}).get("atr_warning", 0.07))
+    if pd.notna(latest.get("ATR %")) and latest["ATR %"] > atr_warning:
         exposure *= 0.5
     if market_regime == "Neutral":
         exposure = min(exposure, 0.6)
@@ -478,11 +533,12 @@ def _explanation(
     latest: pd.Series,
     positive_driver: str,
     main_risk: str,
+    profile: dict,
 ) -> str:
     trend_phrase = (
-        "above its 20-day and 50-day moving averages"
+        "above the selected trend filters"
         if latest["Ticker Close"] > latest["20D SMA"] and latest["Ticker Close"] > latest["50D SMA"]
-        else "not cleanly above its short-term moving averages"
+        else "not cleanly above the selected trend filters"
     )
     rs_phrase = (
         f"outperforming {benchmark}"
@@ -495,14 +551,16 @@ def _explanation(
         else "ATR is contained, so the setup is easier to size."
     )
     return (
-        f"{ticker} has a {setup_label.lower()} with a Swing Score of {score}/100. "
+        f"{ticker} has a {setup_label.lower()} with a {profile['timeframe']} "
+        f"{profile['scope'].lower()} Swing Score of {score}/100. "
         f"The ticker is {trend_phrase}, is {rs_phrase}, and uses {context.sector_etf} / "
         f"{context.industry_proxy} for sector and industry confirmation. "
         f"The strongest driver is {positive_driver}. Main risk: {main_risk}. {risk_phrase}"
     )
 
 
-def _empty_result(ticker: str, warning: str) -> SwingResult:
+def _empty_result(ticker: str, warning: str, profile: dict | None = None) -> SwingResult:
+    profile = profile or get_swing_timeframe_profile("1M")
     return SwingResult(
         score=0,
         setup_label="Bad Setup",
@@ -516,6 +574,25 @@ def _empty_result(ticker: str, warning: str) -> SwingResult:
         close=pd.DataFrame(),
         warnings=[warning],
         explanation=f"{ticker} does not have enough clean data for swing-trading analysis.",
+        score_scope=profile["scope"],
+        score_horizon=profile["timeframe"],
+        signal_summary=_swing_signal_summary(profile),
+        volatility_context={
+            "available": False,
+            "timeframe_preset": DEFAULT_TIMEFRAME_PRESET,
+            "volatility_status": "Unavailable",
+            "swing_risk_label": "Unavailable",
+            "interpretation": warning,
+            "warnings": [warning],
+        },
+    )
+
+
+def _swing_signal_summary(profile: dict) -> str:
+    return (
+        f"RS {', '.join(profile['relative_windows'])} | "
+        f"Support {', '.join(profile['support_windows'])} | "
+        f"Peers {', '.join(profile['peer_windows'])}"
     )
 
 
