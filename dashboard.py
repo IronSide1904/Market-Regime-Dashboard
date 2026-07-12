@@ -9,6 +9,7 @@ import streamlit as st
 
 from config import (
     APP_TITLE,
+    COMBINED_RISK_OVERLAY_CONFIG,
     DEBUG_MODE,
     DEFAULT_BENCHMARK,
     DEFAULT_TIMEFRAME_PRESET,
@@ -26,6 +27,7 @@ from config import (
     get_swing_timeframe_profile,
     get_timeframe_score_profile,
 )
+from combined_risk_overlay import calculate_combined_risk_overlay
 from data import fetch_market_data, get_benchmark_ohlcv, get_comparison_benchmark, get_ticker_metadata, normalize_ticker
 from events import EventContextResult, build_event_context
 from hmm_model import HMMResult, build_hmm_result
@@ -238,6 +240,24 @@ def render_dashboard() -> None:
             options_context=options_context.context,
         )
 
+    combined_risk_overlay = calculate_combined_risk_overlay(
+        mr1_score=float(latest["MR-1 Score"]),
+        mr1_regime=str(latest["Regime"]),
+        clean_relative_trend_score=clean_relative_trend.get("score") if clean_relative_trend.get("available") else None,
+        swing_score=swing_result.score,
+        volume_context=_clean_relative_trend_volume_context(latest),
+        swing_volatility_context=swing_result.volatility_context,
+        benchmark_trend_status=_benchmark_trend_status(latest),
+        data_quality={
+            "warnings": [
+                *market_data.warnings,
+                *clean_relative_trend.get("warnings", []),
+                *swing_result.warnings,
+                *swing_result.volatility_context.get("warnings", []),
+            ]
+        },
+    )
+
     active_tab = _render_tab_buttons(
         [
             "Overview",
@@ -258,6 +278,7 @@ def render_dashboard() -> None:
                 ("Signal Lookbacks", _lookback_summary(lookbacks)),
             ]
         )
+        _render_combined_risk_overlay_headline(combined_risk_overlay, scored=scored)
         _render_summary(
             ticker=ticker,
             benchmark=benchmark,
@@ -404,6 +425,7 @@ def render_dashboard() -> None:
             event_context=event_context,
             swing_result=swing_result,
             clean_relative_trend=clean_relative_trend,
+            combined_risk_overlay=combined_risk_overlay,
         )
 
     elif active_tab == "Relative Context":
@@ -1931,6 +1953,13 @@ def _safe_latest_return(latest: pd.Series) -> float | None:
     return _optional_float(latest.get("Ticker Return")) or _optional_float(latest.get("Daily Return"))
 
 
+def _benchmark_trend_status(latest: pd.Series) -> str:
+    score = _optional_float(latest.get("Benchmark Trend Score"))
+    if score is None:
+        return "Unavailable"
+    return "Bullish" if score > 0 else "Bearish"
+
+
 def _relative_trend_asset_type(ticker: str, metadata: dict) -> str:
     symbol = str(ticker or "").upper()
     name = str(metadata.get("company") or metadata.get("name") or "").lower() if metadata else ""
@@ -2375,7 +2404,150 @@ def _render_overlay_detail_tables(
             )
 
 
+def _render_combined_risk_overlay_headline(combined_risk_overlay: dict, scored: pd.DataFrame | None = None) -> None:
+    if not COMBINED_RISK_OVERLAY_CONFIG.get("enabled", True):
+        return
+
+    st.subheader("Combined Risk Overlay")
+    if not combined_risk_overlay.get("available", False):
+        st.warning(combined_risk_overlay.get("explanation", "Combined Risk Overlay is unavailable."))
+        return
+
+    label = str(combined_risk_overlay.get("overlay_label", "Unavailable"))
+    recommendation = str(combined_risk_overlay.get("final_recommendation", "HOLD"))
+    score = int(combined_risk_overlay.get("overlay_score", 0))
+    status_class = _combined_overlay_status_class(score)
+    st.markdown(
+        f"""
+        <div class="combined-overlay-card signal-{status_class}">
+            <div class="combined-overlay-eyebrow">Final Decision Layer</div>
+            <div class="combined-overlay-title">{escape(label)} - {escape(recommendation)}</div>
+            <div class="combined-overlay-score">{score} / 100</div>
+            <p>{escape(str(combined_risk_overlay.get("explanation", "")))}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Final Recommendation", recommendation)
+    col2.metric("Suggested Exposure", _format_pct(float(combined_risk_overlay.get("suggested_exposure", 0))))
+    col3.metric("Position Size", f"{float(combined_risk_overlay.get('position_size_multiplier', 0)):.2f}x")
+    col4.metric("Confidence", str(combined_risk_overlay.get("confidence", "Low")))
+
+    col5, col6 = st.columns(2)
+    col5.info(f"Main Support: {combined_risk_overlay.get('main_support', 'Unavailable')}")
+    col6.warning(f"Main Warning: {combined_risk_overlay.get('main_warning', 'Unavailable')}")
+    if combined_risk_overlay.get("risk_cap_applied"):
+        st.warning(f"Risk Cap Applied: {combined_risk_overlay.get('risk_cap_reason', 'Risk cap applied')}")
+    if scored is not None and not scored.empty:
+        with st.expander("Combined Risk Overlay History", expanded=False):
+            st.caption(
+                "Estimated history uses historical MR-1 plus the latest setup, volume, and volatility components. "
+                "Current risk caps remain the final decision layer."
+            )
+            st.plotly_chart(
+                _combined_overlay_history_chart(scored=scored, combined_risk_overlay=combined_risk_overlay),
+                width="stretch",
+                key="combined_risk_overlay_history",
+            )
+
+
+def _render_final_decision(combined_risk_overlay: dict) -> None:
+    st.subheader("Final Decision")
+    _render_combined_risk_overlay_headline(combined_risk_overlay)
+    if not combined_risk_overlay.get("available", False):
+        return
+
+    st.markdown("**Why this decision?**")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Positive Drivers**")
+        for driver in combined_risk_overlay.get("positive_drivers", [])[:6] or ["No major positive driver is confirmed."]:
+            st.markdown(f"- {driver}")
+    with col2:
+        st.markdown("**Warnings**")
+        for warning in combined_risk_overlay.get("warnings", [])[:6] or ["No major warning is active."]:
+            st.markdown(f"- {warning}")
+
+    st.dataframe(
+        _combined_overlay_component_table(combined_risk_overlay),
+        use_container_width=True,
+        hide_index=True,
+        height=_table_height(_combined_overlay_component_table(combined_risk_overlay)),
+    )
+
+
+def _combined_overlay_component_table(combined_risk_overlay: dict) -> pd.DataFrame:
+    labels = {
+        "mr1_score": "MR-1 Final Score",
+        "clean_relative_trend_score": "Clean Relative Trend",
+        "swing_score": "Swing Score",
+        "volume_confirmation": "Volume Confirmation",
+        "swing_volatility": "Swing Volatility",
+    }
+    scores = combined_risk_overlay.get("component_scores", {}) or {}
+    contributions = combined_risk_overlay.get("component_contributions", {}) or {}
+    rows = []
+    for key, label in labels.items():
+        score = scores.get(key)
+        contribution = contributions.get(key)
+        rows.append(
+            {
+                "Component": label,
+                "Score": "Unavailable" if score is None else f"{float(score):.0f} / 100",
+                "Weighted Contribution": "N/A" if contribution is None else f"{float(contribution):.1f}",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _combined_overlay_history_chart(scored: pd.DataFrame, combined_risk_overlay: dict) -> go.Figure:
+    fig = go.Figure()
+    if scored.empty or "MR-1 Score" not in scored.columns:
+        fig.add_annotation(text="Overlay history is unavailable.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        return _finish_chart(fig, title="Combined Risk Overlay History")
+
+    component_scores = combined_risk_overlay.get("component_scores", {}) or {}
+    weights = COMBINED_RISK_OVERLAY_CONFIG["weights"]
+    static_contribution = 0.0
+    static_weight = 0.0
+    for key in ["clean_relative_trend_score", "swing_score", "volume_confirmation", "swing_volatility"]:
+        value = component_scores.get(key)
+        if value is None:
+            continue
+        static_contribution += float(value) * float(weights[key])
+        static_weight += float(weights[key])
+    mr1_weight = float(weights["mr1_score"])
+    divisor = mr1_weight + static_weight
+    overlay_series = (scored["MR-1 Score"] * mr1_weight + static_contribution) / divisor if divisor else scored["MR-1 Score"]
+    overlay_series = overlay_series.clip(lower=0, upper=100)
+
+    fig.add_trace(
+        go.Scatter(
+            x=scored.index,
+            y=overlay_series,
+            name="Estimated overlay score",
+            line=dict(color="#38bdf8", width=2.6),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=scored.index,
+            y=scored["MR-1 Score"],
+            name="MR-1 score",
+            line=dict(color="#94a3b8", width=1.8, dash="dot"),
+        )
+    )
+    fig.add_hrect(y0=80, y1=100, fillcolor="rgba(34, 197, 94, 0.12)", line_width=0, annotation_text="Full Risk")
+    fig.add_hrect(y0=65, y1=80, fillcolor="rgba(34, 197, 94, 0.07)", line_width=0, annotation_text="Risk Allowed")
+    fig.add_hrect(y0=50, y1=65, fillcolor="rgba(245, 158, 11, 0.10)", line_width=0, annotation_text="Selective")
+    fig.add_hrect(y0=0, y1=35, fillcolor="rgba(239, 68, 68, 0.10)", line_width=0, annotation_text="Avoid")
+    fig.update_yaxes(range=[0, 100])
+    return _finish_chart(fig, title="Combined Risk Overlay History")
+
+
 def _render_combined_risk_overlay(
+    combined_risk_overlay: dict,
     latest_regime: str,
     scored: pd.DataFrame,
     regime_persistence: RegimePersistenceResult,
@@ -2383,6 +2555,17 @@ def _render_combined_risk_overlay(
     event_context: EventContextResult,
     hmm_result: HMMResult,
 ) -> None:
+    st.subheader("Combined Risk Overlay Details")
+    if combined_risk_overlay.get("available", False):
+        _render_scope_badges(
+            [
+                ("Overlay", combined_risk_overlay.get("overlay_label", "Unavailable")),
+                ("Final", combined_risk_overlay.get("final_recommendation", "HOLD")),
+                ("Cap", "Yes" if combined_risk_overlay.get("risk_cap_applied") else "No"),
+                ("Position", f"{float(combined_risk_overlay.get('position_size_multiplier', 0)):.2f}x"),
+            ]
+        )
+        st.info(combined_risk_overlay.get("explanation", "Combined Risk Overlay explanation is unavailable."))
     latest = scored.iloc[-1]
     overlay = pd.DataFrame(
         [
@@ -2418,17 +2601,20 @@ def _render_recommendation(
     event_context: EventContextResult,
     swing_result: SwingResult,
     clean_relative_trend: dict,
+    combined_risk_overlay: dict,
 ) -> None:
     action = _recommendation_action(latest_score, latest_regime)
     confidence = _confidence_label(latest_score, signals)
     positives = [signal for signal in signals if signal.score > 0]
     negatives = [signal for signal in signals if signal.score == 0]
 
-    st.subheader("Summary Recommendation")
+    _render_final_decision(combined_risk_overlay)
+
+    st.subheader("MR-1 Recommendation Context")
     col1, col2, col3 = st.columns(3)
-    col1.metric("Recommendation", action)
-    col2.metric("Suggested Exposure", _format_pct(exposure))
-    col3.metric("Confidence", confidence)
+    col1.metric("MR-1 Action", action)
+    col2.metric("MR-1 Exposure", _format_pct(exposure))
+    col3.metric("Signal Confidence", confidence)
 
     st.subheader("Explanation")
     for paragraph in _recommendation_paragraphs(
@@ -2458,8 +2644,8 @@ def _render_recommendation(
     st.subheader("Volume Explanation")
     st.write(scored.iloc[-1].get("Volume Explanation", "Volume context is unavailable."))
 
-    st.subheader("Combined Risk Overlay")
     _render_combined_risk_overlay(
+        combined_risk_overlay=combined_risk_overlay,
         latest_regime=latest_regime,
         scored=scored,
         regime_persistence=regime_persistence,
@@ -4264,6 +4450,14 @@ def _trend_quality_status_class(score: int) -> str:
     return "warning"
 
 
+def _combined_overlay_status_class(score: int) -> str:
+    if score >= 65:
+        return "positive"
+    if score >= 50:
+        return "mixed"
+    return "warning"
+
+
 def _filter_scored_by_timeframe(scored: pd.DataFrame, timeframe_label: str) -> pd.DataFrame:
     if scored.empty:
         return scored
@@ -4714,6 +4908,69 @@ def _render_styles() -> None:
         .regime-card ul {
             padding-left: 1.1rem;
             margin: 0.25rem 0 0;
+        }
+        .combined-overlay-card {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid rgba(148, 163, 184, 0.30);
+            border-radius: 8px;
+            padding: 1.15rem 1.25rem;
+            margin-bottom: 1rem;
+            background:
+                linear-gradient(145deg, rgba(15, 23, 42, 0.96), rgba(8, 13, 24, 0.96)),
+                radial-gradient(circle at top right, rgba(34, 211, 238, 0.16), transparent 36%);
+            color: #e5e7eb;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 16px 34px rgba(2, 6, 23, 0.22);
+        }
+        .combined-overlay-card::before {
+            content: "";
+            position: absolute;
+            inset: 0 0 auto 0;
+            height: 4px;
+            background: #64748b;
+        }
+        .combined-overlay-card.signal-positive {
+            border-color: rgba(34, 197, 94, 0.44);
+        }
+        .combined-overlay-card.signal-positive::before {
+            background: linear-gradient(90deg, #22c55e, rgba(34, 197, 94, 0.22));
+        }
+        .combined-overlay-card.signal-mixed {
+            border-color: rgba(245, 158, 11, 0.46);
+        }
+        .combined-overlay-card.signal-mixed::before {
+            background: linear-gradient(90deg, #f59e0b, rgba(245, 158, 11, 0.22));
+        }
+        .combined-overlay-card.signal-warning {
+            border-color: rgba(239, 68, 68, 0.48);
+        }
+        .combined-overlay-card.signal-warning::before {
+            background: linear-gradient(90deg, #ef4444, rgba(239, 68, 68, 0.22));
+        }
+        .combined-overlay-eyebrow {
+            color: #a7f3d0;
+            font-size: 0.78rem;
+            font-weight: 850;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        .combined-overlay-title {
+            color: #f8fafc;
+            font-size: 1.35rem;
+            font-weight: 900;
+            margin-top: 0.25rem;
+        }
+        .combined-overlay-score {
+            color: #e0f2fe;
+            font-size: 2.2rem;
+            font-weight: 850;
+            line-height: 1.05;
+            margin-top: 0.35rem;
+        }
+        .combined-overlay-card p {
+            color: #cbd5e1;
+            margin: 0.75rem 0 0;
+            max-width: 76rem;
         }
         .signal-card {
             position: relative;
