@@ -52,6 +52,7 @@ from regime_persistence import (
 )
 from relative_context import analyze_relative_context
 from relative_trend_quality import calculate_clean_relative_trend_score
+from screener import render_screener_tab
 from scoring import (
     apply_relative_context_adjustment,
     backtest_metrics,
@@ -108,6 +109,29 @@ def render_dashboard() -> None:
         peer_override_mode,
         peer_override_tickers,
     ) = _render_sidebar()
+    tab_labels = [
+        "Overview",
+        "Recommendation",
+        "Swing Trading",
+        "Screener",
+        "Performance Comparison",
+        "Peers / Sector / Industry / Theme",
+        "Relative Context",
+    ]
+    active_tab = _render_tab_buttons(tab_labels)
+    if active_tab == "Screener":
+        _render_last_updated(last_updated_slot, None)
+        _render_scope_badges(
+            [
+                ("Purpose", "Momentum discovery"),
+                ("Engine", "Lightweight batch scan"),
+                ("Limit", "150 tickers"),
+                ("Dashboard", "Open selected ticker"),
+            ]
+        )
+        render_screener_tab()
+        return
+
     score_profile = get_timeframe_score_profile(timeframe_label, sensitivity)
     lookbacks = score_profile["lookbacks"]
     swing_profile = get_swing_timeframe_profile(swing_timeframe)
@@ -262,16 +286,6 @@ def render_dashboard() -> None:
         },
     )
 
-    active_tab = _render_tab_buttons(
-        [
-            "Overview",
-            "Performance Comparison",
-            "Peers / Sector / Industry / Theme",
-            "Recommendation",
-            "Relative Context",
-            "Swing Trading",
-        ]
-    )
     if active_tab == "Overview":
         _render_scope_badges(
             [

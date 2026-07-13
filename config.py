@@ -591,6 +591,42 @@ THEME_GROUPS = {
     "CRYPTO_PROXIES": ["COIN", "MSTR", "IBIT"],
 }
 
+SCREENER_CONFIG = {
+    "enabled": True,
+    "max_tickers": 150,
+    "default_top_n": 25,
+    "default_min_price": 5,
+    "default_min_dollar_volume": 10_000_000,
+    "cache_ttl_seconds": 3600,
+    "default_benchmark": "QQQ",
+    "default_market_benchmark": "SPY",
+    "default_timeframe": "1M",
+    "score_weights": {
+        "price_trend": 25,
+        "momentum": 25,
+        "relative_strength": 30,
+        "volume_confirmation": 10,
+        "risk_volatility": 10,
+    },
+}
+
+SCREENER_WATCHLISTS = {
+    "Mega Cap Tech": ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL"],
+    "AI Semis": ["NVDA", "AMD", "AVGO", "MRVL", "MU", "ARM", "TSM", "ASML"],
+    "Cybersecurity": ["CRWD", "PANW", "ZS", "S", "FTNT", "OKTA"],
+    "Software Growth": ["DDOG", "SNOW", "NET", "MDB", "PLTR", "HUBS"],
+    "Crypto Proxies": ["COIN", "MSTR", "MARA", "RIOT", "IBIT"],
+}
+
+SCREENER_THEME_GROUPS = {
+    "Mega Cap Tech": ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL"],
+    "AI Semiconductors": ["NVDA", "AMD", "AVGO", "MRVL", "MU", "ARM", "TSM", "ASML"],
+    "AI Software": ["PLTR", "SNOW", "DDOG", "NET", "MDB", "AI"],
+    "Cybersecurity": ["CRWD", "PANW", "ZS", "FTNT", "OKTA", "S"],
+    "Bitcoin Proxies": ["COIN", "MSTR", "MARA", "RIOT", "IBIT"],
+    "Ad Tech": ["APP", "TTD", "MGNI", "PUBM", "IAS"],
+}
+
 LEVERAGED_TICKER_MAP = {
     "QQQ": {
         "bull": ["TQQQ"],
