@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+
+
+for _thread_env_key in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_thread_env_key, "1")
 
 import numpy as np
 import pandas as pd
@@ -34,10 +39,10 @@ def build_hmm_result(period: str = "5y") -> HMMResult:
 
     try:
         from hmmlearn.hmm import GaussianHMM
-        from sklearn.preprocessing import StandardScaler
     except ImportError:
-        return _empty_result(
-            "HMM dependencies are not installed. Install hmmlearn and scikit-learn to enable the HMM regime model."
+        GaussianHMM = None
+        warnings.append(
+            "hmmlearn is unavailable on this deployment; using the lightweight fallback regime model."
         )
 
     close = _download_hmm_close(period=period)
@@ -64,20 +69,14 @@ def build_hmm_result(period: str = "5y") -> HMMResult:
             f"HMM needs at least {MIN_HMM_DAYS} clean trading days; only {model_features.shape[0]} are available."
         )
 
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(model_features)
-    model = GaussianHMM(
-        n_components=3,
-        covariance_type="diag",
-        n_iter=1000,
-        random_state=42,
-    )
-
-    try:
-        states = model.fit(scaled).predict(scaled)
-        probabilities = model.predict_proba(scaled)[-1]
-    except Exception as exc:
-        return _empty_result(f"HMM model fitting failed: {exc}")
+    scaled = _standardize_features(model_features)
+    fitted = _fit_regime_model(scaled=scaled, gaussian_hmm=GaussianHMM)
+    if not fitted["available"]:
+        return _empty_result(str(fitted["warning"]))
+    states = fitted["states"]
+    probabilities = fitted["probabilities"]
+    if fitted.get("warning"):
+        warnings.append(str(fitted["warning"]))
 
     state_labels = _label_states(raw_features=raw_features.loc[model_features.index], states=states)
     label_probabilities = _label_probabilities(probabilities=probabilities, state_labels=state_labels)
@@ -146,6 +145,77 @@ def _download_hmm_close(period: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     return close.dropna(how="all")
+
+
+def _standardize_features(model_features: pd.DataFrame) -> np.ndarray:
+    values = model_features.astype(float).to_numpy()
+    means = np.nanmean(values, axis=0)
+    stds = np.nanstd(values, axis=0)
+    stds = np.where(stds == 0, 1.0, stds)
+    return (values - means) / stds
+
+
+def _fit_regime_model(scaled: np.ndarray, gaussian_hmm: object | None) -> dict:
+    if gaussian_hmm is not None:
+        model = gaussian_hmm(
+            n_components=3,
+            covariance_type="diag",
+            n_iter=1000,
+            random_state=42,
+        )
+        try:
+            states = model.fit(scaled).predict(scaled)
+            probabilities = model.predict_proba(scaled)[-1]
+            return {"available": True, "states": states, "probabilities": probabilities, "warning": ""}
+        except Exception as exc:
+            return {"available": False, "warning": f"HMM model fitting failed: {exc}"}
+
+    try:
+        states, probabilities = _fit_lightweight_regime_model(scaled)
+    except Exception as exc:
+        return {"available": False, "warning": f"Fallback regime model fitting failed: {exc}"}
+    return {
+        "available": True,
+        "states": states,
+        "probabilities": probabilities,
+        "warning": "Fallback uses lightweight regime clustering; install hmmlearn for full HMM transition modeling.",
+    }
+
+
+def _fit_lightweight_regime_model(scaled: np.ndarray, n_components: int = 3, max_iter: int = 80) -> tuple[np.ndarray, np.ndarray]:
+    if scaled.shape[0] < n_components:
+        raise ValueError("not enough rows for fallback regime clustering")
+
+    score_axis = np.nanmean(scaled, axis=1)
+    quantile_positions = np.linspace(0.15, 0.85, n_components)
+    seed_indices = np.unique(
+        np.clip((quantile_positions * (scaled.shape[0] - 1)).round().astype(int), 0, scaled.shape[0] - 1)
+    )
+    if seed_indices.shape[0] < n_components:
+        seed_indices = np.arange(n_components)
+    sorted_rows = scaled[np.argsort(score_axis)]
+    centroids = sorted_rows[seed_indices[:n_components]].copy()
+
+    states = np.zeros(scaled.shape[0], dtype=int)
+    for _ in range(max_iter):
+        distances = _squared_distances(scaled, centroids)
+        next_states = np.argmin(distances, axis=1)
+        if np.array_equal(next_states, states):
+            break
+        states = next_states
+        for state in range(n_components):
+            members = scaled[states == state]
+            if members.size:
+                centroids[state] = members.mean(axis=0)
+
+    last_distances = _squared_distances(scaled[-1:, :], centroids)[0]
+    inverse = np.exp(-(last_distances - np.min(last_distances)))
+    probabilities = inverse / inverse.sum()
+    return states, probabilities
+
+
+def _squared_distances(values: np.ndarray, centroids: np.ndarray) -> np.ndarray:
+    return ((values[:, None, :] - centroids[None, :, :]) ** 2).sum(axis=2)
 
 
 def _add_feature(features: dict[str, pd.Series], name: str, series: pd.Series | None) -> None:

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from html import escape
+
+
+for _thread_env_key in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_thread_env_key, "1")
 
 import pandas as pd
 import plotly.graph_objects as go
