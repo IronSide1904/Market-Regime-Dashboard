@@ -2,7 +2,51 @@ from __future__ import annotations
 
 import math
 
-from config import COMBINED_RISK_OVERLAY_CONFIG
+DEFAULT_COMBINED_RISK_OVERLAY_CONFIG = {
+    "enabled": True,
+    "weights": {
+        "mr1_score": 0.35,
+        "clean_relative_trend_score": 0.25,
+        "swing_score": 0.20,
+        "volume_confirmation": 0.10,
+        "swing_volatility": 0.10,
+    },
+    "labels": {
+        "full_risk_allowed": 80,
+        "risk_allowed": 65,
+        "selective_risk": 50,
+        "reduce_risk": 35,
+    },
+    "base_exposure": {
+        "full_risk_allowed": 1.00,
+        "risk_allowed": 0.80,
+        "selective_risk": 0.50,
+        "reduce_risk": 0.30,
+        "avoid_defensive": 0.10,
+    },
+    "position_size_multiplier": {
+        "full_risk_allowed": 1.00,
+        "risk_allowed": 0.75,
+        "selective_risk": 0.50,
+        "reduce_risk": 0.25,
+        "avoid_defensive": 0.00,
+    },
+    "risk_caps": {
+        "defensive_mr1_max_exposure": 0.30,
+        "risk_off_max_exposure": 0.15,
+        "panic_volume_max_exposure": 0.20,
+        "distribution_volume_max_exposure": 0.40,
+        "high_volatility_max_position_multiplier": 0.50,
+        "weak_clean_trend_threshold": 40,
+    },
+}
+
+try:
+    from config import COMBINED_RISK_OVERLAY_CONFIG as PROJECT_COMBINED_RISK_OVERLAY_CONFIG
+except Exception:
+    PROJECT_COMBINED_RISK_OVERLAY_CONFIG = DEFAULT_COMBINED_RISK_OVERLAY_CONFIG
+
+COMBINED_RISK_OVERLAY_CONFIG = PROJECT_COMBINED_RISK_OVERLAY_CONFIG
 
 
 def normalize_volume_context_to_score(volume_context: dict | None) -> float | None:

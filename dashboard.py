@@ -9,7 +9,6 @@ import streamlit as st
 
 from config import (
     APP_TITLE,
-    COMBINED_RISK_OVERLAY_CONFIG,
     DEBUG_MODE,
     DEFAULT_BENCHMARK,
     DEFAULT_TIMEFRAME_PRESET,
@@ -27,7 +26,7 @@ from config import (
     get_swing_timeframe_profile,
     get_timeframe_score_profile,
 )
-from combined_risk_overlay import calculate_combined_risk_overlay
+from combined_risk_overlay import COMBINED_RISK_OVERLAY_CONFIG, calculate_combined_risk_overlay
 from data import fetch_market_data, get_benchmark_ohlcv, get_comparison_benchmark, get_ticker_metadata, normalize_ticker
 from events import EventContextResult, build_event_context
 from hmm_model import HMMResult, build_hmm_result
