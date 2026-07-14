@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import re
 
 import numpy as np
@@ -8,7 +9,14 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-from config import SCREENER_CONFIG, SCREENER_THEME_GROUPS, SCREENER_WATCHLISTS, SECTOR_ETF_MAP
+from config import (
+    SCREENER_CONFIG,
+    SCREENER_PEER_MAP,
+    SCREENER_TARGET_TICKER_CONFIG,
+    SCREENER_THEME_GROUPS,
+    SCREENER_WATCHLISTS,
+    SECTOR_ETF_MAP,
+)
 from data import normalize_ticker
 from finviz_fetcher import remove_dead_local_proxy
 
@@ -41,6 +49,13 @@ SCREENER_PERIODS = {
     "1Y": "2y",
 }
 
+SCREENER_MODES = [
+    "Ticker Comparison",
+    "Theme Screener",
+    "Manual Watchlist",
+    "Sector / Industry Screener",
+]
+
 
 def normalize_ticker_list(raw_input: str | list[str]) -> list[str]:
     if isinstance(raw_input, str):
@@ -54,6 +69,132 @@ def normalize_ticker_list(raw_input: str | list[str]) -> list[str]:
         if ticker and ticker not in tickers:
             tickers.append(ticker)
     return tickers
+
+
+def build_ticker_comparison_universe(
+    target_ticker: str,
+    peer_map: dict,
+    theme_groups: dict,
+    metadata: dict | None = None,
+    include_benchmarks: bool = True,
+) -> dict:
+    target = normalize_ticker(target_ticker)
+    mapped = peer_map.get(target, {})
+    theme = detect_theme_for_ticker(target, theme_groups=theme_groups, peer_map=peer_map, metadata=metadata)
+    benchmark = normalize_ticker(mapped.get("benchmark", SCREENER_CONFIG["default_benchmark"]))
+    market_benchmark = normalize_ticker(mapped.get("market_benchmark", SCREENER_CONFIG["default_market_benchmark"]))
+    sector = metadata.get("sector") if metadata else None
+    industry = metadata.get("industry") if metadata else None
+
+    max_auto_peers = int(SCREENER_TARGET_TICKER_CONFIG.get("max_auto_peers", 25))
+    direct_peers = normalize_ticker_list(mapped.get("direct_peers", []))[:max_auto_peers]
+    theme_peers = normalize_ticker_list(theme_groups.get(theme, [])) if theme else []
+
+    tickers: list[str] = []
+    buckets: dict[str, list[str]] = {}
+
+    def add(symbol: str, bucket: str) -> None:
+        normalized = normalize_ticker(symbol)
+        if not normalized:
+            return
+        if normalized not in tickers:
+            tickers.append(normalized)
+        buckets.setdefault(normalized, [])
+        if bucket not in buckets[normalized]:
+            buckets[normalized].append(bucket)
+
+    if SCREENER_TARGET_TICKER_CONFIG.get("include_target_in_results", True):
+        add(target, "Target")
+    for peer in direct_peers:
+        add(peer, "Direct Peer")
+    for peer in theme_peers:
+        if peer != target:
+            add(peer, "Theme Peer")
+    if include_benchmarks:
+        add(benchmark, "Benchmark")
+        add(market_benchmark, "Market Benchmark")
+
+    return {
+        "target": target,
+        "theme": theme,
+        "sector": sector,
+        "industry": industry,
+        "benchmark": benchmark,
+        "market_benchmark": market_benchmark,
+        "tickers": tickers,
+        "buckets": buckets,
+    }
+
+
+def detect_theme_for_ticker(
+    ticker: str,
+    theme_groups: dict,
+    peer_map: dict | None = None,
+    metadata: dict | None = None,
+) -> str | None:
+    normalized = normalize_ticker(ticker)
+    mapped = (peer_map or {}).get(normalized, {})
+    if mapped.get("theme"):
+        return str(mapped["theme"])
+
+    for theme, tickers in theme_groups.items():
+        if normalized in normalize_ticker_list(tickers):
+            return str(theme)
+
+    sector = str((metadata or {}).get("sector") or "")
+    industry = str((metadata or {}).get("industry") or "")
+    text = f"{sector} {industry}".lower()
+    if "semiconductor" in text:
+        return "AI Semiconductors"
+    if "software" in text:
+        return "AI Software"
+    if "security" in text:
+        return "Cybersecurity"
+    return None
+
+
+def calculate_target_relative_position(
+    target_ticker: str,
+    screener_df: pd.DataFrame,
+    benchmark: str,
+    market_benchmark: str,
+    theme_name: str | None = None,
+) -> dict:
+    target = normalize_ticker(target_ticker)
+    if screener_df.empty or target not in set(screener_df["Ticker"]):
+        return {"available": False, "summary": f"{target} is not available in the screener results."}
+
+    ranked = screener_df.sort_values("Momentum Trend Score", ascending=False).reset_index(drop=True)
+    target_row = ranked.loc[ranked["Ticker"] == target].iloc[0]
+    rank = int(ranked.index[ranked["Ticker"] == target][0]) + 1
+    theme_label = theme_name or "comparison universe"
+    leaders = ranked.loc[ranked["Ticker"] != target].head(1)
+    leader_text = ""
+    if not leaders.empty:
+        leader = leaders.iloc[0]
+        leader_gap = float(target_row["Timeframe Return"] - leader["Timeframe Return"])
+        leader_text = f"{target} is {'outperforming' if leader_gap >= 0 else 'underperforming'} {leader['Ticker']} by {_format_pct(leader_gap)}."
+
+    summary_parts = [
+        f"{target} ranks {rank} / {len(ranked)} in {theme_label}.",
+        f"{target} is {'outperforming' if target_row['RS vs SPY'] >= 0 else 'underperforming'} {market_benchmark} by {_format_pct(target_row['RS vs SPY'])}.",
+        f"{target} is {'outperforming' if target_row['RS vs Benchmark'] >= 0 else 'underperforming'} {benchmark} by {_format_pct(target_row['RS vs Benchmark'])}.",
+        f"{target} is {'outperforming' if target_row['RS vs Theme'] >= 0 else 'underperforming'} the theme median by {_format_pct(target_row['RS vs Theme'])}.",
+        f"Trend: {target_row['Trend']}. Volume confirmation: {target_row['Volume']}.",
+    ]
+    if leader_text:
+        summary_parts.insert(3, leader_text)
+
+    return {
+        "available": True,
+        "target": target,
+        "rank": rank,
+        "universe_size": len(ranked),
+        "theme": theme_label,
+        "score": float(target_row["Momentum Trend Score"]),
+        "label": str(target_row["Label"]),
+        "summary": " ".join(summary_parts),
+    }
 
 
 @st.cache_data(ttl=int(SCREENER_CONFIG["cache_ttl_seconds"]), show_spinner=False)
@@ -90,12 +231,16 @@ def calculate_screener_features(
     window = SCREENER_TIMEFRAME_WINDOWS.get(timeframe, 21)
     benchmark_symbol = str(benchmark_data.get("benchmark_symbol", SCREENER_CONFIG["default_benchmark"]))
     market_symbol = str(benchmark_data.get("market_symbol", SCREENER_CONFIG["default_market_benchmark"]))
+    target_symbol = normalize_ticker(str(benchmark_data.get("target_symbol", "")))
+    include_benchmarks = bool(benchmark_data.get("include_benchmarks", False))
+    buckets = benchmark_data.get("buckets", {}) or {}
     benchmark_return = _timeframe_return(benchmark_data.get("benchmark"), window)
     market_return = _timeframe_return(benchmark_data.get("market"), window)
+    target_return = _timeframe_return(ticker_data.get(target_symbol), window) if target_symbol else np.nan
 
     rows: list[dict] = []
     for ticker, frame in ticker_data.items():
-        if ticker in {benchmark_symbol, market_symbol}:
+        if not include_benchmarks and ticker in {benchmark_symbol, market_symbol}:
             continue
         row = _build_feature_row(
             ticker=ticker,
@@ -106,6 +251,7 @@ def calculate_screener_features(
             market_return=market_return,
         )
         if row:
+            row["Bucket"] = _bucket_label(buckets.get(ticker, []))
             rows.append(row)
 
     if not rows:
@@ -116,6 +262,7 @@ def calculate_screener_features(
     theme_median = float(theme_returns.median()) if not theme_returns.dropna().empty else float(features["Timeframe Return"].median())
     features["Theme Median Return"] = theme_median
     features["RS vs Theme"] = features["Timeframe Return"] - theme_median
+    features["RS vs Target"] = features["Timeframe Return"] - target_return if math.isfinite(float(target_return)) else np.nan
     features["RS Composite"] = features[["RS vs Benchmark", "RS vs SPY", "RS vs Theme"]].mean(axis=1)
     features["Momentum Percentile"] = features["Timeframe Return"].rank(pct=True)
     features["RS Percentile"] = features["RS Composite"].rank(pct=True)
@@ -126,6 +273,8 @@ def calculate_screener_features(
     features["RS vs Sector"] = np.nan
     features["RS vs Industry"] = np.nan
     features["Confidence"] = "Medium"
+    if "Bucket" not in features.columns:
+        features["Bucket"] = "Universe"
     return features
 
 
@@ -242,8 +391,8 @@ def calculate_momentum_trend_score(features_df: pd.DataFrame) -> pd.DataFrame:
 def render_screener_tab() -> None:
     st.subheader("Stock Momentum Screener")
     st.caption(
-        "Lightweight discovery tool for clean momentum versus a benchmark, SPY, and the selected theme/universe. "
-        "It does not run full MR-1 analysis for every ticker."
+        "Ticker-driven momentum discovery: compare a target stock against the peers, theme, benchmarks, "
+        "and watchlists that actually matter. It does not run full MR-1 analysis for every ticker."
     )
 
     controls = _render_screener_controls()
@@ -260,6 +409,8 @@ def render_screener_tab() -> None:
         f" | **Market:** {controls['market_benchmark']}"
         f" | **Timeframe:** {controls['timeframe']}"
     )
+    if controls.get("mode") == "Ticker Comparison":
+        _render_comparison_universe_preview(controls)
 
     if not universe_tickers:
         st.info("Choose a universe or paste tickers to run the screener.")
@@ -293,11 +444,22 @@ def render_screener_tab() -> None:
             "market": market,
             "benchmark_symbol": controls["benchmark"],
             "market_symbol": controls["market_benchmark"],
+            "target_symbol": controls.get("target_ticker", ""),
+            "include_benchmarks": controls.get("include_benchmarks", False),
+            "buckets": controls.get("buckets", {}),
         },
-        theme_tickers=universe_tickers,
+        theme_tickers=controls.get("theme_tickers", universe_tickers),
         timeframe=controls["timeframe"],
     )
     scored = calculate_momentum_trend_score(features)
+    if controls.get("mode") == "Ticker Comparison":
+        _render_target_relative_summary(
+            target_ticker=controls["target_ticker"],
+            scored=scored,
+            benchmark=controls["benchmark"],
+            market_benchmark=controls["market_benchmark"],
+            theme_name=controls.get("detected_theme"),
+        )
     filtered = _apply_screener_filters(scored, controls)
     sorted_df = _sort_screener(filtered, controls["sort_by"]).head(int(controls["top_n"]))
 
@@ -312,12 +474,24 @@ def render_screener_tab() -> None:
         st.warning("No tickers passed the selected filters.")
         return
 
-    st.dataframe(
-        _display_columns(sorted_df),
-        use_container_width=True,
-        hide_index=True,
-        column_config=_column_config(),
-    )
+    display_df = _display_columns(sorted_df, include_target=controls.get("mode") == "Ticker Comparison")
+    if controls.get("mode") == "Ticker Comparison" and SCREENER_TARGET_TICKER_CONFIG.get("highlight_target_row", True):
+        st.dataframe(
+            display_df.style.apply(
+                lambda row: ["background-color: rgba(34, 211, 238, 0.16)" if row.get("Bucket") == "Target" else "" for _ in row],
+                axis=1,
+            ),
+            use_container_width=True,
+            hide_index=True,
+            column_config=_column_config(),
+        )
+    else:
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config=_column_config(),
+        )
 
     with st.expander("Advanced screener columns", expanded=False):
         st.dataframe(
@@ -331,40 +505,68 @@ def render_screener_tab() -> None:
 
 
 def _render_screener_controls() -> dict:
-    source_options = ["Theme Group", "Watchlist", "Manual Ticker List", "Sector ETF List"]
+    default_mode = str(SCREENER_TARGET_TICKER_CONFIG.get("default_mode", "Ticker Comparison"))
+    preset = _load_preset_from_session()
     with st.form("screener_controls"):
+        st.markdown("**Ticker comparison setup**")
+        target_ticker = normalize_ticker(
+            st.text_input("Target ticker", value=str(preset.get("target_ticker", "AMD")))
+        )
+        mode = st.selectbox(
+            "Screener mode",
+            SCREENER_MODES,
+            index=SCREENER_MODES.index(str(preset.get("mode", default_mode))) if str(preset.get("mode", default_mode)) in SCREENER_MODES else 0,
+        )
+        target_universe = build_ticker_comparison_universe(
+            target_ticker=target_ticker,
+            peer_map=SCREENER_PEER_MAP,
+            theme_groups=SCREENER_THEME_GROUPS,
+            include_benchmarks=bool(SCREENER_TARGET_TICKER_CONFIG.get("include_benchmarks_in_results", True)),
+        )
         col1, col2, col3 = st.columns(3)
         with col1:
-            universe_source = st.selectbox("Universe source", source_options, index=0)
-            theme = st.selectbox("Theme group", list(SCREENER_THEME_GROUPS.keys()), index=0)
+            theme_default = target_universe.get("theme") or str(preset.get("theme", "Mega Cap Tech"))
+            theme_options = list(SCREENER_THEME_GROUPS.keys())
+            theme = st.selectbox(
+                "Theme group",
+                theme_options,
+                index=theme_options.index(theme_default) if theme_default in theme_options else 0,
+            )
             watchlist = st.selectbox("Watchlist", list(SCREENER_WATCHLISTS.keys()), index=0)
         with col2:
             benchmark = normalize_ticker(
-                st.text_input("Benchmark", value=str(SCREENER_CONFIG["default_benchmark"]))
+                st.text_input("Benchmark", value=str(preset.get("benchmark", target_universe.get("benchmark") or SCREENER_CONFIG["default_benchmark"])))
             )
             market_benchmark = normalize_ticker(
-                st.text_input("Market benchmark", value=str(SCREENER_CONFIG["default_market_benchmark"]))
+                st.text_input("Market benchmark", value=str(preset.get("market_benchmark", target_universe.get("market_benchmark") or SCREENER_CONFIG["default_market_benchmark"])))
             )
             timeframe_options = list(SCREENER_TIMEFRAME_WINDOWS.keys())
             timeframe = st.selectbox(
                 "Timeframe",
                 timeframe_options,
-                index=timeframe_options.index(str(SCREENER_CONFIG["default_timeframe"])),
+                index=timeframe_options.index(str(preset.get("timeframe", SCREENER_CONFIG["default_timeframe"]))),
             )
         with col3:
-            min_price = st.number_input("Minimum price", min_value=0.0, value=float(SCREENER_CONFIG["default_min_price"]), step=1.0)
+            filters = preset.get("filters", {}) if isinstance(preset.get("filters"), dict) else {}
+            min_price = st.number_input("Minimum price", min_value=0.0, value=float(filters.get("min_price", SCREENER_CONFIG["default_min_price"])), step=1.0)
             min_dollar_volume = st.number_input(
                 "Minimum dollar volume",
                 min_value=0.0,
-                value=float(SCREENER_CONFIG["default_min_dollar_volume"]),
+                value=float(filters.get("min_dollar_volume", SCREENER_CONFIG["default_min_dollar_volume"])),
                 step=1_000_000.0,
             )
-            top_n = st.number_input("Top N", min_value=1, max_value=int(SCREENER_CONFIG["max_tickers"]), value=int(SCREENER_CONFIG["default_top_n"]))
+            top_n = st.number_input("Top N", min_value=1, max_value=int(SCREENER_CONFIG["max_tickers"]), value=int(filters.get("top_n", SCREENER_CONFIG["default_top_n"])))
 
+        comparison_default = ", ".join(preset.get("comparison_tickers", target_universe["tickers"]))
+        comparison_tickers_text = st.text_area(
+            "Edit comparison tickers",
+            value=comparison_default,
+            help="Used in Ticker Comparison mode. Include or remove peers manually; the 150 ticker safety cap still applies.",
+        )
         manual_tickers = st.text_area(
             "Manual ticker input",
             value="NVDA, AMD, AVGO, MRVL, MU",
-            help="Used when Universe source is Manual Ticker List. Commas, spaces, and new lines are supported.",
+            help="Used in Manual Watchlist mode. Commas, spaces, and new lines are supported.",
         )
 
         f1, f2, f3, f4 = st.columns(4)
@@ -373,7 +575,7 @@ def _render_screener_controls() -> dict:
             only_above_50d = st.checkbox("Only above 50D SMA", value=False)
         with f2:
             only_above_200d = st.checkbox("Only above 200D SMA", value=False)
-            only_outperforming_benchmark = st.checkbox("Only outperforming benchmark", value=True)
+            only_outperforming_benchmark = st.checkbox("Only outperforming benchmark", value=mode != "Ticker Comparison")
         with f3:
             only_outperforming_theme = st.checkbox("Only outperforming theme", value=False)
             exclude_high_volatility = st.checkbox("Exclude high volatility names", value=False)
@@ -385,6 +587,7 @@ def _render_screener_controls() -> dict:
                     "Momentum Trend Score",
                     "Timeframe Return",
                     "RS vs Benchmark",
+                    "RS vs Target",
                     "RS vs Theme",
                     "Volume Confirmation Score",
                     "ATR %",
@@ -395,11 +598,51 @@ def _render_screener_controls() -> dict:
 
         run = st.form_submit_button("Run Screener", type="primary")
 
-    if universe_source == "Sector ETF List":
-        st.caption("Sector ETF List uses sector ETFs as a lightweight sector universe. Stock sector/industry screening requires Finviz metadata and is not run by default.")
+    comparison_tickers = normalize_ticker_list(comparison_tickers_text)
+    buckets = {ticker: list(values) for ticker, values in (target_universe.get("buckets", {}) or {}).items()}
+    if mode == "Ticker Comparison":
+        buckets.setdefault(target_ticker, ["Target"])
+        buckets.setdefault(benchmark or str(SCREENER_CONFIG["default_benchmark"]), ["Benchmark"])
+        buckets.setdefault(market_benchmark or str(SCREENER_CONFIG["default_market_benchmark"]), ["Market Benchmark"])
+        for ticker in comparison_tickers:
+            buckets.setdefault(ticker, ["Manual Override"])
+    if mode == "Sector / Industry Screener":
+        st.caption("Sector / Industry Screener currently uses sector ETFs as a lightweight universe. Stock sector/industry peer expansion can be enhanced with Finviz metadata later.")
+
+    preset_payload = _build_preset_payload(
+        mode=mode,
+        target_ticker=target_ticker,
+        theme=theme,
+        comparison_tickers=comparison_tickers,
+        benchmark=benchmark or str(SCREENER_CONFIG["default_benchmark"]),
+        market_benchmark=market_benchmark or str(SCREENER_CONFIG["default_market_benchmark"]),
+        timeframe=timeframe,
+        filters={"min_price": float(min_price), "min_dollar_volume": float(min_dollar_volume), "top_n": int(top_n)},
+    )
+    with st.expander("Save / load screener preset", expanded=False):
+        uploaded = st.file_uploader("Load preset JSON", type=["json"], key="screener_preset_upload")
+        if uploaded is not None:
+            try:
+                st.session_state["screener_loaded_preset"] = json.loads(uploaded.getvalue().decode("utf-8"))
+                st.success("Preset loaded. The controls will update on the next rerun.")
+            except Exception as exc:
+                st.warning(f"Could not load preset: {exc}")
+        st.download_button(
+            "Download current preset JSON",
+            data=json.dumps(preset_payload, indent=2),
+            file_name=f"mr1_screener_{target_ticker or 'preset'}.json",
+            mime="application/json",
+        )
 
     return {
-        "universe_source": universe_source,
+        "mode": mode,
+        "target_ticker": target_ticker,
+        "target_universe": target_universe,
+        "detected_theme": target_universe.get("theme") or theme,
+        "buckets": buckets,
+        "comparison_tickers": comparison_tickers,
+        "include_benchmarks": mode == "Ticker Comparison" and bool(SCREENER_TARGET_TICKER_CONFIG.get("include_benchmarks_in_results", True)),
+        "theme_tickers": normalize_ticker_list(SCREENER_THEME_GROUPS.get(target_universe.get("theme") or theme, [])),
         "theme": theme,
         "watchlist": watchlist,
         "manual_tickers": manual_tickers,
@@ -422,14 +665,85 @@ def _render_screener_controls() -> dict:
 
 
 def _resolve_universe(controls: dict) -> list[str]:
-    source = controls["universe_source"]
-    if source == "Manual Ticker List":
+    mode = controls["mode"]
+    if mode == "Ticker Comparison":
+        return normalize_ticker_list(controls.get("comparison_tickers", []))
+    if mode == "Manual Watchlist":
         return normalize_ticker_list(controls["manual_tickers"])
-    if source == "Watchlist":
-        return normalize_ticker_list(SCREENER_WATCHLISTS.get(controls["watchlist"], []))
-    if source == "Sector ETF List":
+    if mode == "Sector / Industry Screener":
         return normalize_ticker_list(SECTOR_ETF_MAP.values())
     return normalize_ticker_list(SCREENER_THEME_GROUPS.get(controls["theme"], []))
+
+
+def _render_comparison_universe_preview(controls: dict) -> None:
+    universe = controls.get("target_universe", {})
+    tickers = normalize_ticker_list(controls.get("comparison_tickers", []))
+    target = controls.get("target_ticker") or universe.get("target")
+    st.info(
+        f"**{target} comparison universe** | "
+        f"Detected theme: {universe.get('theme') or 'Not detected'} | "
+        f"Sector: {universe.get('sector') or 'Unavailable'} | "
+        f"Industry: {universe.get('industry') or 'Unavailable'} | "
+        f"Benchmark: {controls['benchmark']} | Market: {controls['market_benchmark']}"
+    )
+    st.caption(f"{target} will be compared against: {', '.join(tickers)}")
+
+
+def _render_target_relative_summary(
+    target_ticker: str,
+    scored: pd.DataFrame,
+    benchmark: str,
+    market_benchmark: str,
+    theme_name: str | None,
+) -> None:
+    summary = calculate_target_relative_position(
+        target_ticker=target_ticker,
+        screener_df=scored,
+        benchmark=benchmark,
+        market_benchmark=market_benchmark,
+        theme_name=theme_name,
+    )
+    if not summary.get("available"):
+        st.warning(summary.get("summary", "Target summary unavailable."))
+        return
+    st.markdown(f"### {summary['target']} Relative Position")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Universe Rank", f"{summary['rank']} / {summary['universe_size']}")
+    c2.metric("Momentum Score", f"{summary['score']:.0f}/100")
+    c3.metric("Label", summary["label"])
+    st.info(summary["summary"])
+
+
+def _load_preset_from_session() -> dict:
+    preset = st.session_state.get("screener_loaded_preset")
+    return preset if isinstance(preset, dict) else {}
+
+
+def _build_preset_payload(
+    mode: str,
+    target_ticker: str,
+    theme: str,
+    comparison_tickers: list[str],
+    benchmark: str,
+    market_benchmark: str,
+    timeframe: str,
+    filters: dict,
+) -> dict:
+    return {
+        "mode": mode,
+        "target_ticker": target_ticker,
+        "theme": theme,
+        "comparison_tickers": comparison_tickers,
+        "benchmark": benchmark,
+        "market_benchmark": market_benchmark,
+        "timeframe": timeframe,
+        "filters": filters,
+    }
+
+
+def _bucket_label(buckets: list[str] | tuple[str, ...] | None) -> str:
+    values = [str(bucket) for bucket in (buckets or []) if str(bucket)]
+    return " / ".join(values) if values else "Universe"
 
 
 def _build_feature_row(
@@ -572,21 +886,33 @@ def _render_selected_ticker_preview(df: pd.DataFrame, timeframe: str, benchmark:
         st.rerun()
 
 
-def _display_columns(df: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "Rank",
-        "Ticker",
-        "Momentum Trend Score",
-        "Label",
-        "Timeframe Return",
-        "RS vs Benchmark",
-        "RS vs Theme",
-        "Trend",
-        "Volume",
-        "Risk",
-    ]
+def _display_columns(df: pd.DataFrame, include_target: bool = False) -> pd.DataFrame:
+    columns = ["Rank", "Ticker"]
+    if include_target:
+        columns.append("Bucket")
+    columns.extend(
+        [
+            "Momentum Trend Score",
+            "Label",
+            "Timeframe Return",
+        ]
+    )
+    if include_target:
+        columns.append("RS vs Target")
+    columns.extend(
+        [
+            "RS vs Benchmark",
+            "RS vs SPY",
+            "RS vs Theme",
+            "Trend",
+            "Volume",
+            "Risk",
+        ]
+    )
     display = df[columns].copy()
-    for column in ["Timeframe Return", "RS vs Benchmark", "RS vs Theme"]:
+    for column in ["Timeframe Return", "RS vs Target", "RS vs Benchmark", "RS vs SPY", "RS vs Theme"]:
+        if column not in display.columns:
+            continue
         display[column] = display[column] * 100
     return display
 
@@ -594,6 +920,7 @@ def _display_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "Ticker",
+        "Bucket",
         "Company",
         "Sector",
         "Industry",
@@ -603,6 +930,7 @@ def _advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
         "ATR %",
         "Distance 50D SMA",
         "Distance 200D SMA",
+        "RS vs Target",
         "RS vs SPY",
         "RS vs Sector",
         "RS vs Industry",
@@ -616,6 +944,7 @@ def _advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Distance 50D SMA",
         "Distance 200D SMA",
         "RS vs SPY",
+        "RS vs Target",
         "RS vs Sector",
         "RS vs Industry",
         "Volume Percentile",
@@ -629,7 +958,9 @@ def _column_config() -> dict:
     return {
         "Momentum Trend Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
         "Timeframe Return": st.column_config.NumberColumn("Timeframe Return", format="%.1f%%"),
+        "RS vs Target": st.column_config.NumberColumn("RS vs Target", format="%.1f%%"),
         "RS vs Benchmark": st.column_config.NumberColumn("RS vs Benchmark", format="%.1f%%"),
+        "RS vs SPY": st.column_config.NumberColumn("RS vs SPY", format="%.1f%%"),
         "RS vs Theme": st.column_config.NumberColumn("RS vs Theme", format="%.1f%%"),
     }
 
@@ -642,6 +973,7 @@ def _advanced_column_config() -> dict:
         "ATR %": st.column_config.NumberColumn("ATR %", format="%.1f%%"),
         "Distance 50D SMA": st.column_config.NumberColumn("Dist 50D", format="%.1f%%"),
         "Distance 200D SMA": st.column_config.NumberColumn("Dist 200D", format="%.1f%%"),
+        "RS vs Target": st.column_config.NumberColumn("RS vs Target", format="%.1f%%"),
         "RS vs SPY": st.column_config.NumberColumn("RS vs SPY", format="%.1f%%"),
         "RS vs Sector": st.column_config.NumberColumn("RS vs Sector", format="%.1f%%"),
         "RS vs Industry": st.column_config.NumberColumn("RS vs Industry", format="%.1f%%"),

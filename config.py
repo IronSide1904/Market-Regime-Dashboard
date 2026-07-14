@@ -627,6 +627,54 @@ SCREENER_THEME_GROUPS = {
     "Ad Tech": ["APP", "TTD", "MGNI", "PUBM", "IAS"],
 }
 
+SCREENER_TARGET_TICKER_CONFIG = {
+    "enabled": True,
+    "default_mode": "Ticker Comparison",
+    "include_target_in_results": True,
+    "include_benchmarks_in_results": True,
+    "highlight_target_row": True,
+    "max_auto_peers": 25,
+}
+
+SCREENER_PEER_MAP = {
+    "AMD": {
+        "theme": "AI Semiconductors",
+        "direct_peers": ["NVDA", "INTC", "AVGO", "MRVL", "MU", "ARM", "QCOM", "TSM", "ASML"],
+        "benchmark": "QQQ",
+        "market_benchmark": "SPY",
+    },
+    "NVDA": {
+        "theme": "AI Semiconductors",
+        "direct_peers": ["AMD", "AVGO", "MRVL", "MU", "ARM", "TSM", "ASML", "INTC"],
+        "benchmark": "QQQ",
+        "market_benchmark": "SPY",
+    },
+    "AAPL": {
+        "theme": "Mega Cap Tech",
+        "direct_peers": ["MSFT", "GOOGL", "AMZN", "META", "NVDA"],
+        "benchmark": "QQQ",
+        "market_benchmark": "SPY",
+    },
+    "MSFT": {
+        "theme": "Mega Cap Tech",
+        "direct_peers": ["AAPL", "GOOGL", "AMZN", "META", "NVDA"],
+        "benchmark": "QQQ",
+        "market_benchmark": "SPY",
+    },
+    "META": {
+        "theme": "Mega Cap Tech",
+        "direct_peers": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"],
+        "benchmark": "QQQ",
+        "market_benchmark": "SPY",
+    },
+    "COIN": {
+        "theme": "Bitcoin Proxies",
+        "direct_peers": ["MSTR", "MARA", "RIOT", "IBIT"],
+        "benchmark": "QQQ",
+        "market_benchmark": "SPY",
+    },
+}
+
 LEVERAGED_TICKER_MAP = {
     "QQQ": {
         "bull": ["TQQQ"],
