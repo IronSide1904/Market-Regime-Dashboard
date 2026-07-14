@@ -6,10 +6,13 @@ import re
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
 from config import (
+    SCREENER_BUCKET_ANALYSIS_CONFIG,
+    SCREENER_BUCKET_CHART_OPTIONS,
     SCREENER_CONFIG,
     SCREENER_PEER_MAP,
     SCREENER_TARGET_TICKER_CONFIG,
@@ -379,6 +382,7 @@ def calculate_momentum_trend_score(features_df: pd.DataFrame) -> pd.DataFrame:
             "Risk Volatility Score",
         ]
     ].sum(axis=1).clip(0, 100)
+    scored["Combined Overlay Score"] = scored.apply(_approx_combined_overlay_score, axis=1)
     scored["Label"] = scored["Momentum Trend Score"].apply(_score_label)
     scored["Rank"] = scored["Momentum Trend Score"].rank(method="first", ascending=False).astype(int)
     scored["Trend"] = scored.apply(_trend_status, axis=1)
@@ -500,6 +504,15 @@ def render_screener_tab() -> None:
             hide_index=True,
             column_config=_advanced_column_config(),
         )
+
+    render_bucket_analysis_section(
+        results_df=scored,
+        target_ticker=controls.get("target_ticker"),
+        ticker_data=ticker_data,
+        benchmark=controls["benchmark"],
+        market_benchmark=controls["market_benchmark"],
+        timeframe=controls["timeframe"],
+    )
 
     _render_selected_ticker_preview(sorted_df, timeframe=controls["timeframe"], benchmark=controls["benchmark"])
 
@@ -798,6 +811,7 @@ def _build_feature_row(
         "Avg Volume 20D": avg_volume20,
         "Avg Volume 50D": avg_volume50,
         "Dollar Volume": dollar_volume,
+        "Average Daily Float Turnover": np.nan,
         "RVOL 20D": rvol20,
         "Volume Percentile": volume_percentile,
         "Distribution Warning": bool(one_day_return < -0.02 and (rvol20 if math.isfinite(rvol20) else 0) >= 1.5),
@@ -867,6 +881,361 @@ def _sort_screener(df: pd.DataFrame, sort_by: str) -> pd.DataFrame:
     if df.empty or sort_by not in df.columns:
         return df
     return df.sort_values(sort_by, ascending=False).reset_index(drop=True)
+
+
+def group_screener_results_by_bucket(results_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    if results_df.empty or "Bucket" not in results_df.columns:
+        return {}
+
+    bucket_order = [
+        "Target",
+        "Direct Peer",
+        "Theme Peer",
+        "Sector Peer",
+        "Industry Peer",
+        "Benchmark",
+        "Market Benchmark",
+        "Manual Override",
+        "Universe",
+    ]
+    grouped: dict[str, pd.DataFrame] = {}
+    for bucket in bucket_order:
+        mask = results_df["Bucket"].astype(str).str.split(" / ").apply(lambda labels: bucket in labels)
+        bucket_df = results_df.loc[mask].copy()
+        if not bucket_df.empty:
+            grouped[_bucket_display_name(bucket)] = bucket_df.sort_values(
+                ["Momentum Trend Score", "Timeframe Return"], ascending=False
+            ).reset_index(drop=True)
+
+    return grouped
+
+
+def render_bucket_table(bucket_name: str, bucket_df: pd.DataFrame) -> None:
+    del bucket_name
+    if bucket_df.empty:
+        st.info("No tickers in this bucket.")
+        return
+    st.dataframe(
+        _bucket_table_columns(bucket_df),
+        use_container_width=True,
+        hide_index=True,
+        column_config=_bucket_column_config(),
+    )
+
+
+def render_bucket_chart(bucket_name: str, bucket_df: pd.DataFrame, chart_type: str, target_ticker: str | None = None) -> None:
+    if bucket_df.empty:
+        st.info(f"No chart data for {bucket_name}.")
+        return
+
+    chart_map = {
+        "Combined Overlay Score": "Combined Overlay Score",
+        "Momentum Trend Score": "Momentum Trend Score",
+        "Average Daily Float Turnover": "Average Daily Float Turnover",
+        "RS vs Target": "RS vs Target",
+        "RS vs QQQ": "RS vs Benchmark",
+        "RS vs SPY": "RS vs SPY",
+        "RS vs Theme": "RS vs Theme",
+        "Timeframe Return": "Timeframe Return",
+        "ATR % Price": "ATR %",
+    }
+    column = chart_map.get(chart_type)
+    if not column or column not in bucket_df.columns:
+        st.info(f"{chart_type} is unavailable for this bucket.")
+        return
+
+    chart_df = bucket_df[["Ticker", column]].copy()
+    chart_df[column] = pd.to_numeric(chart_df[column], errors="coerce")
+    chart_df = chart_df.dropna(subset=[column])
+    if chart_df.empty:
+        st.info(f"{chart_type} unavailable for this bucket.")
+        return
+    if chart_type == "Average Daily Float Turnover":
+        st.info("Float turnover unavailable for this bucket.")
+        return
+
+    percent_chart = chart_type in {"RS vs Target", "RS vs QQQ", "RS vs SPY", "RS vs Theme", "Timeframe Return", "ATR % Price"}
+    y_values = chart_df[column] * 100 if percent_chart else chart_df[column]
+    colors = [
+        "#22d3ee" if target_ticker and normalize_ticker(ticker) == normalize_ticker(target_ticker) else "#60a5fa"
+        for ticker in chart_df["Ticker"]
+    ]
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=chart_df["Ticker"],
+                y=y_values,
+                marker_color=colors,
+                text=[f"{value:.1f}" for value in y_values],
+                textposition="outside",
+            )
+        ]
+    )
+    if chart_type in {"Combined Overlay Score", "Momentum Trend Score"}:
+        fig.add_hline(y=80 if chart_type == "Combined Overlay Score" else 65, line_dash="dash", line_color="#22c55e")
+        fig.add_hline(y=50, line_dash="dash", line_color="#f59e0b")
+    fig.update_layout(
+        title=f"{bucket_name} - {chart_type}",
+        height=430,
+        margin=dict(l=20, r=20, t=55, b=40),
+        template="plotly_dark",
+        yaxis_title="%" if percent_chart else "Score",
+        xaxis_title="Ticker",
+    )
+    st.plotly_chart(fig, width="stretch", key=f"bucket_chart_{bucket_name}_{chart_type}")
+
+
+def calculate_overlay_history_for_bucket_tickers(
+    tickers: list[str],
+    benchmark: str,
+    market_benchmark: str,
+    timeframe: str,
+    max_tickers: int = 10,
+    ticker_data: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
+    del benchmark, market_benchmark
+    selected = normalize_ticker_list(tickers)[:max_tickers]
+    if not selected:
+        return pd.DataFrame()
+    data = ticker_data or fetch_screener_data(selected, period=SCREENER_PERIODS.get(timeframe, "2y"))
+
+    history = pd.DataFrame()
+    for ticker in selected:
+        frame = _clean_ohlcv(data.get(ticker, pd.DataFrame()))
+        if frame.empty or "Close" not in frame.columns:
+            continue
+        score = _approx_overlay_history(frame=frame, timeframe=timeframe)
+        if not score.empty:
+            history[ticker] = score
+    return history.dropna(how="all")
+
+
+def render_combined_overlay_history_chart(
+    overlay_history_df: pd.DataFrame,
+    target_ticker: str | None = None,
+    thresholds: dict | None = None,
+) -> None:
+    if overlay_history_df.empty:
+        st.info("Combined overlay history is unavailable for the selected bucket tickers.")
+        return
+
+    thresholds = thresholds or {"Full Risk Allowed": 80, "Risk Allowed": 65, "Selective Risk": 50, "Reduce Risk": 35}
+    fig = go.Figure()
+    for ticker in overlay_history_df.columns:
+        is_target = target_ticker and normalize_ticker(ticker) == normalize_ticker(target_ticker)
+        fig.add_trace(
+            go.Scatter(
+                x=overlay_history_df.index,
+                y=overlay_history_df[ticker],
+                mode="lines",
+                name=ticker,
+                line=dict(width=4 if is_target else 2),
+            )
+        )
+
+    if SCREENER_BUCKET_ANALYSIS_CONFIG.get("show_threshold_bands", True):
+        fig.add_hrect(y0=80, y1=100, fillcolor="rgba(34,197,94,0.16)", line_width=0)
+        fig.add_hrect(y0=50, y1=80, fillcolor="rgba(245,158,11,0.13)", line_width=0)
+        fig.add_hrect(y0=0, y1=50, fillcolor="rgba(239,68,68,0.15)", line_width=0)
+    for label, value in thresholds.items():
+        fig.add_hline(y=value, line_dash="dash", line_color="#94a3b8", annotation_text=label)
+    fig.update_layout(
+        title="All Buckets Overlay - Approximate Combined Score History",
+        height=520,
+        template="plotly_dark",
+        yaxis=dict(title="Combined Overlay Score", range=[0, 100]),
+        xaxis_title="Date",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.28, xanchor="left", x=0),
+        margin=dict(l=20, r=20, t=60, b=95),
+    )
+    st.plotly_chart(fig, width="stretch", key="screener_all_bucket_overlay_history")
+
+
+def render_bucket_analysis_section(
+    results_df: pd.DataFrame,
+    target_ticker: str | None = None,
+    ticker_data: dict[str, pd.DataFrame] | None = None,
+    benchmark: str = "QQQ",
+    market_benchmark: str = "SPY",
+    timeframe: str = "1M",
+) -> None:
+    if not SCREENER_BUCKET_ANALYSIS_CONFIG.get("enabled", True) or results_df.empty:
+        return
+
+    grouped = group_screener_results_by_bucket(results_df)
+    if not grouped:
+        return
+
+    st.subheader("Bucket Analysis")
+    tab_names = [*grouped.keys()]
+    if SCREENER_BUCKET_ANALYSIS_CONFIG.get("show_overlay_history_chart", True):
+        tab_names.append("All Buckets Overlay")
+    tabs = st.tabs(tab_names)
+
+    for tab, bucket_name in zip(tabs, tab_names):
+        with tab:
+            if bucket_name == "All Buckets Overlay":
+                limit = st.slider(
+                    "Overlay chart ticker limit",
+                    min_value=3,
+                    max_value=15,
+                    value=int(SCREENER_BUCKET_ANALYSIS_CONFIG.get("overlay_history_max_tickers", 10)),
+                    step=1,
+                    key="bucket_overlay_limit",
+                )
+                selected = _select_overlay_history_tickers(results_df, target_ticker=target_ticker, limit=limit)
+                st.caption(f"Showing approximate overlay history for: {', '.join(selected)}")
+                history = calculate_overlay_history_for_bucket_tickers(
+                    tickers=selected,
+                    benchmark=benchmark,
+                    market_benchmark=market_benchmark,
+                    timeframe=timeframe,
+                    max_tickers=limit,
+                    ticker_data=ticker_data,
+                )
+                render_combined_overlay_history_chart(history, target_ticker=target_ticker)
+                continue
+
+            bucket_df = grouped[bucket_name]
+            _render_bucket_summary(bucket_name=bucket_name, bucket_df=bucket_df, target_ticker=target_ticker)
+            if SCREENER_BUCKET_ANALYSIS_CONFIG.get("show_bucket_tables", True):
+                render_bucket_table(bucket_name=bucket_name, bucket_df=bucket_df)
+            if SCREENER_BUCKET_ANALYSIS_CONFIG.get("show_bucket_charts", True):
+                default_chart = str(SCREENER_BUCKET_ANALYSIS_CONFIG.get("default_bucket_chart", "Combined Overlay Score"))
+                chart_type = st.selectbox(
+                    "Chart type",
+                    SCREENER_BUCKET_CHART_OPTIONS,
+                    index=SCREENER_BUCKET_CHART_OPTIONS.index(default_chart) if default_chart in SCREENER_BUCKET_CHART_OPTIONS else 0,
+                    key=f"bucket_chart_type_{bucket_name}",
+                )
+                render_bucket_chart(bucket_name=bucket_name, bucket_df=bucket_df, chart_type=chart_type, target_ticker=target_ticker)
+
+
+def _render_bucket_summary(bucket_name: str, bucket_df: pd.DataFrame, target_ticker: str | None = None) -> None:
+    top = bucket_df.iloc[0] if not bucket_df.empty else {}
+    avg_score = float(bucket_df["Momentum Trend Score"].mean()) if "Momentum Trend Score" in bucket_df else 0.0
+    target_rank = "N/A"
+    if target_ticker and not bucket_df.empty and normalize_ticker(target_ticker) in set(bucket_df["Ticker"]):
+        ranked = bucket_df.sort_values("Momentum Trend Score", ascending=False).reset_index(drop=True)
+        target_rank = f"{int(ranked.index[ranked['Ticker'] == normalize_ticker(target_ticker)][0]) + 1} / {len(ranked)}"
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Bucket", bucket_name)
+    col2.metric("Tickers", f"{len(bucket_df)}")
+    col3.metric("Top ticker", str(top.get("Ticker", "N/A")))
+    col4.metric("Avg score", f"{avg_score:.0f}")
+    if target_ticker:
+        st.caption(f"{normalize_ticker(target_ticker)} rank in bucket: {target_rank}")
+
+
+def _bucket_display_name(bucket: str) -> str:
+    if bucket == "Direct Peer":
+        return "Direct Peers"
+    if bucket == "Theme Peer":
+        return "Theme Peers"
+    if bucket == "Sector Peer":
+        return "Sector Peers"
+    if bucket == "Industry Peer":
+        return "Industry Peers"
+    if bucket in {"Benchmark", "Market Benchmark"}:
+        return "Benchmarks" if bucket == "Benchmark" else "Market Benchmarks"
+    return bucket
+
+
+def _bucket_table_columns(bucket_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Rank",
+        "Ticker",
+        "Bucket",
+        "Momentum Trend Score",
+        "Combined Overlay Score",
+        "Label",
+        "Timeframe Return",
+        "RS vs Target",
+        "RS vs Benchmark",
+        "RS vs SPY",
+        "RS vs Theme",
+        "Trend",
+        "Volume",
+        "Risk",
+    ]
+    existing = [column for column in columns if column in bucket_df.columns]
+    display = bucket_df[existing].copy()
+    for column in ["Timeframe Return", "RS vs Target", "RS vs Benchmark", "RS vs SPY", "RS vs Theme"]:
+        if column in display.columns:
+            display[column] = display[column] * 100
+    return display
+
+
+def _bucket_column_config() -> dict:
+    return {
+        "Momentum Trend Score": st.column_config.ProgressColumn("Momentum", min_value=0, max_value=100, format="%.0f"),
+        "Combined Overlay Score": st.column_config.ProgressColumn("Overlay", min_value=0, max_value=100, format="%.0f"),
+        "Timeframe Return": st.column_config.NumberColumn("Timeframe Return", format="%.1f%%"),
+        "RS vs Target": st.column_config.NumberColumn("RS vs Target", format="%.1f%%"),
+        "RS vs Benchmark": st.column_config.NumberColumn("RS vs QQQ", format="%.1f%%"),
+        "RS vs SPY": st.column_config.NumberColumn("RS vs SPY", format="%.1f%%"),
+        "RS vs Theme": st.column_config.NumberColumn("RS vs Theme", format="%.1f%%"),
+    }
+
+
+def _select_overlay_history_tickers(results_df: pd.DataFrame, target_ticker: str | None, limit: int) -> list[str]:
+    selected: list[str] = []
+
+    def add(symbol: str | None) -> None:
+        ticker = normalize_ticker(symbol or "")
+        if ticker and ticker not in selected:
+            selected.append(ticker)
+
+    add(target_ticker)
+    for _, row in results_df.iterrows():
+        bucket = str(row.get("Bucket", ""))
+        if "Benchmark" in bucket:
+            add(str(row.get("Ticker", "")))
+    ranked = results_df.sort_values("Momentum Trend Score", ascending=False)
+    for _, row in ranked.iterrows():
+        add(str(row.get("Ticker", "")))
+        if len(selected) >= limit:
+            break
+    return selected[:limit]
+
+
+def _approx_combined_overlay_score(row) -> float:
+    momentum = _number(row.get("Momentum Trend Score")) or 0.0
+    rs = _number(row.get("RS Percentile"))
+    rs_score = (rs * 100) if rs is not None else 50.0
+    volume = (_number(row.get("Volume Confirmation Score")) or 0.0) * 10
+    risk = (_number(row.get("Risk Volatility Score")) or 0.0) * 10
+    score = momentum * 0.45 + rs_score * 0.25 + volume * 0.15 + risk * 0.15
+    return float(max(0, min(100, score)))
+
+
+def _approx_overlay_history(frame: pd.DataFrame, timeframe: str) -> pd.Series:
+    clean = _clean_ohlcv(frame)
+    if clean.shape[0] < 80:
+        return pd.Series(dtype=float)
+    close = clean["Close"].astype(float)
+    volume = clean["Volume"].astype(float) if "Volume" in clean.columns else pd.Series(index=clean.index, dtype=float)
+    window = SCREENER_TIMEFRAME_WINDOWS.get(timeframe, 21)
+
+    ret = close.pct_change(window)
+    momentum_score = (50 + ret.clip(-0.30, 0.30) * 120).clip(0, 100)
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    trend_score = (
+        (close > sma20).astype(float) * 20
+        + (close > sma50).astype(float) * 25
+        + (close > sma200).astype(float) * 25
+        + (sma20 > sma50).astype(float) * 15
+        + (sma50 > sma200).astype(float) * 15
+    )
+    rvol = volume / volume.rolling(20).mean()
+    volume_score = (50 + (rvol - 1).clip(-1, 1.5) * 25).clip(0, 100)
+    realized_vol = close.pct_change().rolling(20).std() * np.sqrt(252)
+    risk_score = (100 - realized_vol.fillna(0.35).clip(0, 1.2) * 70).clip(0, 100)
+    overlay = trend_score * 0.40 + momentum_score * 0.30 + volume_score * 0.15 + risk_score * 0.15
+    return overlay.dropna().clip(0, 100).tail(252)
 
 
 def _render_selected_ticker_preview(df: pd.DataFrame, timeframe: str, benchmark: str) -> None:

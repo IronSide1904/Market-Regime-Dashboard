@@ -675,6 +675,29 @@ SCREENER_PEER_MAP = {
     },
 }
 
+SCREENER_BUCKET_ANALYSIS_CONFIG = {
+    "enabled": True,
+    "show_bucket_tables": True,
+    "show_bucket_charts": True,
+    "default_bucket_chart": "Combined Overlay Score",
+    "show_overlay_history_chart": True,
+    "overlay_history_max_tickers": 10,
+    "highlight_target_ticker": True,
+    "show_threshold_bands": True,
+}
+
+SCREENER_BUCKET_CHART_OPTIONS = [
+    "Combined Overlay Score",
+    "Momentum Trend Score",
+    "Average Daily Float Turnover",
+    "RS vs Target",
+    "RS vs QQQ",
+    "RS vs SPY",
+    "RS vs Theme",
+    "Timeframe Return",
+    "ATR % Price",
+]
+
 LEVERAGED_TICKER_MAP = {
     "QQQ": {
         "bull": ["TQQQ"],
