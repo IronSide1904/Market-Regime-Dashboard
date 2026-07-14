@@ -44,7 +44,7 @@ from metadata import (
     THEME_TICKERS,
     get_asset_context,
 )
-from options_data import OptionsVolatilityResult, build_options_volatility_context
+from options_data import UNAVAILABLE_OPTIONS, OptionsVolatilityResult, build_options_volatility_context
 from regime_persistence import (
     RegimePersistenceResult,
     analyze_regime_persistence,
@@ -108,6 +108,7 @@ def render_dashboard() -> None:
         volatility_preset_choice,
         peer_override_mode,
         peer_override_tickers,
+        load_advanced_overlays,
     ) = _render_sidebar()
     tab_labels = [
         "Overview",
@@ -169,7 +170,8 @@ def render_dashboard() -> None:
         st.error("Ticker not found or data unavailable.")
         st.stop()
 
-    ticker_metadata = get_ticker_metadata(ticker)
+    needs_metadata = active_tab in {"Peers / Sector / Industry / Theme"} or load_advanced_overlays
+    ticker_metadata = get_ticker_metadata(ticker) if needs_metadata else {"available": False, "ticker": ticker}
     shares_float = ticker_metadata.get("shares_float")
     scored = score_history(
         indicators,
@@ -236,43 +238,66 @@ def render_dashboard() -> None:
     for warning in market_data.warnings:
         st.warning(warning)
 
-    with st.spinner("Loading expanded HMM market regime..."):
-        hmm_result = _load_hmm_result()
+    needs_hmm = active_tab in {"Recommendation", "Swing Trading"} or load_advanced_overlays
+    needs_swing = active_tab in {
+        "Recommendation",
+        "Swing Trading",
+        "Performance Comparison",
+        "Peers / Sector / Industry / Theme",
+    } or load_advanced_overlays
+    needs_options_events = active_tab in {
+        "Recommendation",
+        "Swing Trading",
+        "Peers / Sector / Industry / Theme",
+    } or load_advanced_overlays
 
-    with st.spinner(f"Loading {ticker} swing-trading context..."):
-        swing_result = build_swing_result(
-            ticker=ticker,
-            benchmark=benchmark,
-            context=context,
-            market_regime=str(latest["Regime"]),
-            swing_timeframe=swing_timeframe,
-            volatility_timeframe_config=volatility_timeframe_config,
-        )
+    if needs_hmm:
+        with st.spinner("Loading expanded HMM market regime..."):
+            hmm_result = _load_hmm_result()
+    else:
+        hmm_result = _unavailable_hmm_result()
+
+    if needs_swing:
+        with st.spinner(f"Loading {ticker} swing-trading context..."):
+            swing_result = build_swing_result(
+                ticker=ticker,
+                benchmark=benchmark,
+                context=context,
+                market_regime=str(latest["Regime"]),
+                swing_timeframe=swing_timeframe,
+                volatility_timeframe_config=volatility_timeframe_config,
+            )
+    else:
+        swing_result = _unavailable_swing_result(profile=swing_profile)
 
     regime_persistence = analyze_regime_persistence(display_scored)
     latest_rvol = _optional_float(latest.get("RVOL Medium"))
     if latest_rvol is None:
         latest_rvol = _optional_float(latest.get("RVOL 20D"))
-    with st.spinner(f"Loading {ticker} options and event overlays..."):
-        options_context = _load_options_volatility_context(
-            ticker=ticker,
-            price_df=market_data.ticker_ohlcv,
-            latest_regime=str(latest["Regime"]),
-            latest_rvol=latest_rvol,
-            finviz_snapshot=ticker_metadata,
-        )
-        event_context = _load_event_context(
-            ticker=ticker,
-            latest_rvol=latest_rvol,
-            volume_context=str(latest.get("Volume Context", "Unavailable")),
-            options_context=options_context.context,
-        )
+    if needs_options_events:
+        with st.spinner(f"Loading {ticker} options and event overlays..."):
+            options_context = _load_options_volatility_context(
+                ticker=ticker,
+                price_df=market_data.ticker_ohlcv,
+                latest_regime=str(latest["Regime"]),
+                latest_rvol=latest_rvol,
+                finviz_snapshot=ticker_metadata,
+            )
+            event_context = _load_event_context(
+                ticker=ticker,
+                latest_rvol=latest_rvol,
+                volume_context=str(latest.get("Volume Context", "Unavailable")),
+                options_context=options_context.context,
+            )
+    else:
+        options_context = _unavailable_options_context()
+        event_context = _unavailable_event_context()
 
     combined_risk_overlay = calculate_combined_risk_overlay(
         mr1_score=float(latest["MR-1 Score"]),
         mr1_regime=str(latest["Regime"]),
         clean_relative_trend_score=clean_relative_trend.get("score") if clean_relative_trend.get("available") else None,
-        swing_score=swing_result.score,
+        swing_score=swing_result.score if needs_swing else None,
         volume_context=_clean_relative_trend_volume_context(latest),
         swing_volatility_context=swing_result.volatility_context,
         benchmark_trend_status=_benchmark_trend_status(latest),
@@ -287,6 +312,11 @@ def render_dashboard() -> None:
     )
 
     if active_tab == "Overview":
+        if not load_advanced_overlays:
+            st.info(
+                "Fast load is active. HMM, options, news/event, and swing overlays are skipped on Overview "
+                "so the app opens quickly. Turn on 'Load advanced overlays on Overview' in the sidebar to include them."
+            )
         _render_scope_badges(
             [
                 ("Score", "Latest MR-1 reading"),
@@ -487,6 +517,61 @@ def _load_hmm_result() -> HMMResult:
     return build_hmm_result()
 
 
+def _unavailable_hmm_result() -> HMMResult:
+    return HMMResult(
+        available=False,
+        regime="Not loaded",
+        confidence=0.0,
+        transition_risk="Not loaded",
+        bull_probability=0.0,
+        neutral_probability=0.0,
+        stress_probability=0.0,
+        feature_count=0,
+        feature_names=[],
+        last_updated=None,
+        warnings=["HMM skipped for fast Overview load. Open Recommendation/Swing Trading or enable advanced overlays."],
+    )
+
+
+def _unavailable_swing_result(profile: dict) -> SwingResult:
+    return SwingResult(
+        score=0,
+        setup_label="Not loaded",
+        action="Open Swing Trading tab to load",
+        exposure=0.0,
+        positive_driver="Swing context skipped for fast Overview load.",
+        main_risk="Swing context not loaded.",
+        signals=[],
+        performance_table=pd.DataFrame(),
+        swing_frame=pd.DataFrame(),
+        close=pd.DataFrame(),
+        warnings=["Swing context skipped for fast Overview load."],
+        explanation="Swing Trading data is loaded only when needed to keep the app responsive.",
+        score_scope=str(profile.get("scope", "Unavailable")),
+        score_horizon=str(profile.get("timeframe", "Unavailable")),
+        signal_summary="Not loaded",
+        volatility_context={
+            "available": False,
+            "volatility_status": "Unavailable",
+            "warnings": ["Swing volatility skipped for fast Overview load."],
+        },
+    )
+
+
+def _unavailable_options_context() -> OptionsVolatilityResult:
+    return UNAVAILABLE_OPTIONS
+
+
+def _unavailable_event_context() -> EventContextResult:
+    return EventContextResult(
+        available=False,
+        catalyst_status="Not loaded",
+        event_risk="Not loaded",
+        explanation="Event/news overlay skipped for fast Overview load.",
+        warnings=["Event/news overlay skipped for fast Overview load."],
+    )
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def _load_benchmark_ohlcv(benchmark: str, period: str = "1y") -> pd.DataFrame:
     return get_benchmark_ohlcv(benchmark=benchmark, period=period)
@@ -558,7 +643,7 @@ def _render_last_updated(
     )
 
 
-def _render_sidebar() -> tuple[str, str, str, str, str, str, str, list[str]]:
+def _render_sidebar() -> tuple[str, str, str, str, str, str, str, list[str], bool]:
     with st.sidebar:
         st.header("Controls")
         if "active_benchmark" not in st.session_state:
@@ -658,6 +743,11 @@ def _render_sidebar() -> tuple[str, str, str, str, str, str, str, list[str]]:
                 st.json(get_timeframe_config(volume_preset))
                 st.markdown("Swing Volatility")
                 st.json(get_timeframe_config(volatility_preset))
+        load_advanced_overlays = st.checkbox(
+            "Load advanced overlays on Overview",
+            value=False,
+            help="Loads HMM, options chains, news/events, and swing overlays on the Overview tab. Leave off for faster Streamlit startup.",
+        )
         st.caption("Ticker search lives in the top bar.")
 
     return (
@@ -669,6 +759,7 @@ def _render_sidebar() -> tuple[str, str, str, str, str, str, str, list[str]]:
         volatility_preset_choice,
         peer_override_mode,
         peer_override_tickers,
+        load_advanced_overlays,
     )
 
 
