@@ -18,6 +18,8 @@ from config import (
     DEFAULT_BENCHMARK,
     DEFAULT_TIMEFRAME_PRESET,
     DEFAULT_TICKER,
+    PEER_GROUPS,
+    PEER_OVERRIDE_CONFIG,
     REGIME_RULES,
     RELATIVE_CONTEXT_CONFIG,
     RELATIVE_TREND_QUALITY_CONFIG,
@@ -31,6 +33,7 @@ from config import (
     get_swing_timeframe_profile,
     get_timeframe_score_profile,
 )
+from comparison import resolve_comparison_ticker, validate_comparison_ohlcv
 from combined_risk_overlay import COMBINED_RISK_OVERLAY_CONFIG, calculate_combined_risk_overlay
 from data import fetch_market_data, get_benchmark_ohlcv, get_comparison_benchmark, get_ticker_metadata, normalize_ticker
 from events import EventContextResult, build_event_context
@@ -107,9 +110,9 @@ def render_dashboard() -> None:
         volume_preset_choice,
         volatility_preset_choice,
         peer_override_mode,
-        peer_override_tickers,
+        peer_override_ticker,
         load_advanced_overlays,
-    ) = _render_sidebar()
+    ) = _render_sidebar(ticker)
     tab_labels = [
         "Overview",
         "Recommendation",
@@ -183,35 +186,46 @@ def render_dashboard() -> None:
     signals = latest_signal_breakdown(scored, ticker=ticker, benchmark=benchmark)
     positive_driver, negative_driver = main_drivers(signals)
     latest = scored.iloc[-1]
-    context = _apply_peer_override(
-        context=get_asset_context(ticker=ticker, benchmark=benchmark),
-        ticker=ticker,
-        mode=peer_override_mode,
-        override_tickers=peer_override_tickers,
-    )
+    context = get_asset_context(ticker=ticker, benchmark=benchmark)
 
-    comparison_benchmark = get_comparison_benchmark(
+    default_comparison_ticker = get_comparison_benchmark(
         ticker=ticker,
         metadata=ticker_metadata,
         user_benchmark=benchmark,
     )
+    comparison_resolution = resolve_comparison_ticker(
+        selected_ticker=ticker,
+        benchmark_ticker=default_comparison_ticker,
+        peer_override_mode=peer_override_mode,
+        peer_override_ticker=peer_override_ticker,
+    )
+    comparison_ticker = comparison_resolution["comparison_ticker"]
     if RELATIVE_CONTEXT_CONFIG.get("enabled", True):
-        with st.spinner(f"Loading {ticker} relative context vs {comparison_benchmark}..."):
-            benchmark_ohlcv = _load_benchmark_ohlcv(comparison_benchmark, period=TIMEFRAMES[timeframe_label])
+        with st.spinner(f"Loading {ticker} relative context vs {comparison_ticker}..."):
+            benchmark_ohlcv = _load_benchmark_ohlcv(comparison_ticker, period=TIMEFRAMES[timeframe_label])
+            comparison_resolution, benchmark_ohlcv = _validate_or_fallback_comparison(
+                comparison_resolution=comparison_resolution,
+                ticker=ticker,
+                fallback_ticker=default_comparison_ticker,
+                comparison_ohlcv=benchmark_ohlcv,
+                period=TIMEFRAMES[timeframe_label],
+            )
+            comparison_ticker = comparison_resolution["comparison_ticker"]
             relative_context = analyze_relative_context(
                 ticker=ticker,
-                benchmark=comparison_benchmark,
+                benchmark=comparison_ticker,
                 ticker_ohlcv=market_data.ticker_ohlcv,
                 benchmark_ohlcv=benchmark_ohlcv,
                 ticker_volume_metrics=_ticker_relative_volume_metrics(latest),
                 benchmark_volume_metrics=_benchmark_relative_volume_metrics(benchmark_ohlcv),
             )
+            relative_context.update(_comparison_context_metadata(comparison_resolution, benchmark))
     else:
         benchmark_ohlcv = pd.DataFrame()
         relative_context = {
             "available": False,
             "ticker": ticker.upper(),
-            "benchmark": comparison_benchmark.upper(),
+            "benchmark": comparison_ticker.upper(),
             "relationship_status": "Unavailable",
             "score_adjustment": 0,
             "confidence": "Low",
@@ -219,13 +233,19 @@ def render_dashboard() -> None:
             "warnings": ["Relative Context is disabled."],
             "history": pd.DataFrame(),
         }
+        relative_context.update(_comparison_context_metadata(comparison_resolution, benchmark))
+    context = _apply_peer_override(
+        context=context,
+        ticker=ticker,
+        comparison_resolution=comparison_resolution,
+    )
     relative_adjusted_score = int(round(apply_relative_context_adjustment(float(latest["MR-1 Score"]), relative_context)))
     relative_adjusted_regime = get_regime(relative_adjusted_score)
     relative_adjusted_exposure = get_exposure(relative_adjusted_regime)
     ticker_quality_ohlcv = market_data.ticker_ohlcv.copy()
     benchmark_quality_ohlcv = benchmark_ohlcv.copy()
     ticker_quality_ohlcv.attrs["symbol"] = ticker.upper()
-    benchmark_quality_ohlcv.attrs["symbol"] = comparison_benchmark.upper()
+    benchmark_quality_ohlcv.attrs["symbol"] = comparison_ticker.upper()
     clean_relative_trend = calculate_clean_relative_trend_score(
         ticker_df=ticker_quality_ohlcv,
         benchmark_df=benchmark_quality_ohlcv,
@@ -233,8 +253,11 @@ def render_dashboard() -> None:
         volume_context=_clean_relative_trend_volume_context(latest),
         asset_type=_relative_trend_asset_type(ticker=ticker, metadata=ticker_metadata),
     )
+    _annotate_clean_relative_trend(clean_relative_trend, comparison_resolution)
 
     _render_last_updated(last_updated_slot, scored.index[-1])
+    if comparison_resolution.get("warning"):
+        st.warning(str(comparison_resolution["warning"]))
     for warning in market_data.warnings:
         st.warning(warning)
 
@@ -310,6 +333,7 @@ def render_dashboard() -> None:
             ]
         },
     )
+    _annotate_combined_risk_overlay(combined_risk_overlay, comparison_resolution)
 
     if active_tab == "Overview":
         if not load_advanced_overlays:
@@ -324,6 +348,7 @@ def render_dashboard() -> None:
                 ("Dashboard TF", timeframe_label),
                 ("Sensitivity", sensitivity),
                 ("Signal Lookbacks", _lookback_summary(lookbacks)),
+                ("Comparison", f"{comparison_ticker} ({comparison_resolution['comparison_type']})"),
             ]
         )
         _render_combined_risk_overlay_headline(combined_risk_overlay, scored=scored)
@@ -474,6 +499,8 @@ def render_dashboard() -> None:
             swing_result=swing_result,
             clean_relative_trend=clean_relative_trend,
             combined_risk_overlay=combined_risk_overlay,
+            comparison_ticker=comparison_ticker,
+            comparison_type=comparison_resolution["comparison_type"],
         )
 
     elif active_tab == "Relative Context":
@@ -481,7 +508,7 @@ def render_dashboard() -> None:
             [
                 ("Layer", "Small MR-1 modifier"),
                 ("Dashboard TF", timeframe_label),
-                ("Benchmark", comparison_benchmark),
+                ("Comparison", f"{comparison_ticker} ({comparison_resolution['comparison_type']})"),
                 ("Score Impact", _format_signed_points(int(relative_context.get("score_adjustment", 0)))),
             ]
         )
@@ -643,7 +670,7 @@ def _render_last_updated(
     )
 
 
-def _render_sidebar() -> tuple[str, str, str, str, str, str, str, list[str], bool]:
+def _render_sidebar(ticker: str) -> tuple[str, str, str, str, str, str, str, str | None, bool]:
     with st.sidebar:
         st.header("Controls")
         if "active_benchmark" not in st.session_state:
@@ -704,26 +731,62 @@ def _render_sidebar() -> tuple[str, str, str, str, str, str, str, list[str], boo
         )
         st.caption(f"Volume Context: {_preset_scope_summary(volume_preset)} via {_preset_choice_label(volume_preset_choice)}.")
         st.caption(f"Swing Volatility: {_volatility_scope_summary(volatility_preset)} via {_preset_choice_label(volatility_preset_choice)}.")
-        with st.expander("Peer Override", expanded=False):
-            peer_override_mode = st.radio(
-                "Peer override mode",
-                ["Auto", "Add to auto peers", "Replace auto peers"],
-                index=0,
-                help="Use Auto for curated/Yahoo peers. Add appends your tickers. Replace uses only your tickers.",
-            )
-            peer_override_text = st.text_input(
-                "Peer tickers",
-                value="",
-                placeholder="AMD, AVGO, MU, MRVL",
-                help="Comma or space separated. Crypto slash formats like BTC/USD are converted to BTC-USD.",
-            )
-            peer_override_tickers = _parse_ticker_list(peer_override_text)
-            if peer_override_mode == "Auto":
-                st.caption("Using the dashboard's curated/Yahoo peer logic.")
-            elif peer_override_tickers:
-                st.caption(f"{peer_override_mode}: {', '.join(peer_override_tickers)}")
-            else:
-                st.caption("Enter at least one ticker to activate the override.")
+        peer_override_mode = PEER_OVERRIDE_CONFIG.get("default_mode", "Auto")
+        peer_override_ticker = None
+        if PEER_OVERRIDE_CONFIG.get("enabled", True):
+            with st.expander("Peer Override", expanded=False):
+                normalized_ticker = normalize_ticker(ticker)
+                suggested_peers = PEER_GROUPS.get(normalized_ticker, [])
+                mode_options = ["Auto", "Suggested Peer", "Custom Ticker", "Disabled"]
+                if "peer_override_mode" not in st.session_state:
+                    st.session_state["peer_override_mode"] = PEER_OVERRIDE_CONFIG.get("default_mode", "Auto")
+                if st.session_state["peer_override_mode"] not in mode_options:
+                    st.session_state["peer_override_mode"] = PEER_OVERRIDE_CONFIG.get("default_mode", "Auto")
+
+                peer_override_mode = st.selectbox(
+                    "Peer Override Mode",
+                    mode_options,
+                    index=mode_options.index(st.session_state["peer_override_mode"]),
+                    key="peer_override_mode",
+                    help="Auto and Disabled use the benchmark. Suggested/Custom use that ticker for Relative Context and Clean Relative Trend.",
+                )
+
+                if suggested_peers:
+                    current_suggested = st.session_state.get("peer_override_suggested_ticker")
+                    if current_suggested not in suggested_peers:
+                        st.session_state["peer_override_suggested_ticker"] = suggested_peers[0]
+                    suggested_peer = st.selectbox(
+                        "Suggested Peer",
+                        suggested_peers,
+                        index=suggested_peers.index(st.session_state["peer_override_suggested_ticker"]),
+                        key="peer_override_suggested_ticker",
+                    )
+                else:
+                    suggested_peer = None
+                    st.caption(f"No suggested peers are configured for {normalized_ticker}; Custom Ticker still works.")
+
+                if "peer_override_custom_ticker" not in st.session_state:
+                    st.session_state["peer_override_custom_ticker"] = ""
+                custom_peer = st.text_input(
+                    "Custom Peer Ticker",
+                    key="peer_override_custom_ticker",
+                    placeholder="NVDA, SMH, BTC-USD...",
+                    help="Crypto slash formats like BTC/USD are converted to BTC-USD.",
+                )
+
+                if peer_override_mode == "Suggested Peer":
+                    peer_override_ticker = suggested_peer
+                elif peer_override_mode == "Custom Ticker":
+                    peer_override_ticker = normalize_ticker(custom_peer)
+                else:
+                    peer_override_ticker = None
+
+                if peer_override_mode in {"Auto", "Disabled"}:
+                    st.caption("Relative Context and Clean Relative Trend use the active benchmark.")
+                elif peer_override_ticker:
+                    st.caption(f"Relative comparison will try to use {peer_override_ticker}.")
+                else:
+                    st.caption("Enter or choose a peer to activate the override.")
         st.markdown("**Timeframe Scope**")
         st.caption("Timeframe: changes MR-1 score horizon, charts, backtests, and Volume Context when its preset is Auto.")
         st.caption("Swing timeframe: changes Swing Score horizon, focused return window, and Swing Volatility when its preset is Auto.")
@@ -758,7 +821,7 @@ def _render_sidebar() -> tuple[str, str, str, str, str, str, str, list[str], boo
         volume_preset_choice,
         volatility_preset_choice,
         peer_override_mode,
-        peer_override_tickers,
+        peer_override_ticker,
         load_advanced_overlays,
     )
 
@@ -772,26 +835,98 @@ def _parse_ticker_list(raw: str) -> list[str]:
     return tickers
 
 
-def _apply_peer_override(context, ticker: str, mode: str, override_tickers: list[str]):
-    if mode == "Auto" or not override_tickers:
+def _apply_peer_override(context, ticker: str, comparison_resolution: dict | None):
+    if not comparison_resolution or not comparison_resolution.get("is_override_active"):
         return context
 
     normalized_ticker = normalize_ticker(ticker)
-    clean_override = [symbol for symbol in override_tickers if symbol and symbol != normalized_ticker]
-    if not clean_override:
+    comparison_ticker = normalize_ticker(str(comparison_resolution.get("comparison_ticker") or ""))
+    if not comparison_ticker or comparison_ticker == normalized_ticker:
         return context
 
-    if mode == "Replace auto peers":
-        peers = clean_override
-        source = "Manual peer override"
-    else:
-        peers = []
-        for symbol in [*context.peers, *clean_override]:
-            if symbol and symbol != normalized_ticker and symbol not in peers:
-                peers.append(symbol)
-        source = f"{context.peer_source} + manual peer override"
+    peers = []
+    for symbol in [comparison_ticker, *context.peers]:
+        if symbol and symbol != normalized_ticker and symbol not in peers:
+            peers.append(symbol)
+    source = f"{context.peer_source} + comparison peer override"
 
     return replace(context, peers=peers, peer_source=source)
+
+
+def _validate_or_fallback_comparison(
+    comparison_resolution: dict,
+    ticker: str,
+    fallback_ticker: str,
+    comparison_ohlcv: pd.DataFrame,
+    period: str,
+) -> tuple[dict, pd.DataFrame]:
+    if not comparison_resolution.get("is_override_active"):
+        return comparison_resolution, comparison_ohlcv
+
+    validation_warning = validate_comparison_ohlcv(
+        selected_ticker=ticker,
+        comparison_ticker=str(comparison_resolution.get("comparison_ticker") or ""),
+        comparison_ohlcv=comparison_ohlcv,
+        min_required_rows=int(PEER_OVERRIDE_CONFIG.get("min_required_rows", 60)),
+    )
+    if validation_warning is None:
+        return comparison_resolution, comparison_ohlcv
+
+    fallback = normalize_ticker(fallback_ticker or DEFAULT_BENCHMARK)
+    fallback_ohlcv = _load_benchmark_ohlcv(fallback, period=period)
+    updated = {
+        **comparison_resolution,
+        "comparison_ticker": fallback,
+        "comparison_type": "Benchmark",
+        "is_override_active": False,
+        "warning": f"Peer override ticker could not be loaded. Using {fallback} benchmark instead. {validation_warning}",
+    }
+    return updated, fallback_ohlcv
+
+
+def _comparison_context_metadata(comparison_resolution: dict, benchmark: str) -> dict:
+    return {
+        "comparison_ticker": str(comparison_resolution.get("comparison_ticker") or benchmark).upper(),
+        "comparison_type": str(comparison_resolution.get("comparison_type") or "Benchmark"),
+        "comparison_mode": str(comparison_resolution.get("mode") or "Auto"),
+        "comparison_requested_ticker": comparison_resolution.get("requested_ticker"),
+        "comparison_is_override_active": bool(comparison_resolution.get("is_override_active")),
+        "benchmark_ticker": str(benchmark or DEFAULT_BENCHMARK).upper(),
+    }
+
+
+def _annotate_clean_relative_trend(clean_relative_trend: dict, comparison_resolution: dict) -> None:
+    comparison_ticker = str(comparison_resolution.get("comparison_ticker") or "").upper()
+    comparison_type = str(comparison_resolution.get("comparison_type") or "Benchmark")
+    if not comparison_ticker:
+        return
+    clean_relative_trend["comparison_ticker"] = comparison_ticker
+    clean_relative_trend["comparison_type"] = comparison_type
+    clean_relative_trend["comparison_is_override_active"] = bool(comparison_resolution.get("is_override_active"))
+    if clean_relative_trend.get("available"):
+        clean_relative_trend["explanation"] = (
+            f"{clean_relative_trend.get('explanation', 'Trend quality is available.')} "
+            f"Comparison uses {comparison_ticker} ({comparison_type})."
+        )
+
+
+def _annotate_combined_risk_overlay(combined_risk_overlay: dict, comparison_resolution: dict) -> None:
+    comparison_ticker = str(comparison_resolution.get("comparison_ticker") or "").upper()
+    comparison_type = str(comparison_resolution.get("comparison_type") or "Benchmark")
+    if not comparison_ticker or not combined_risk_overlay.get("available"):
+        return
+    combined_risk_overlay["comparison_ticker"] = comparison_ticker
+    combined_risk_overlay["comparison_type"] = comparison_type
+    if comparison_resolution.get("is_override_active"):
+        combined_risk_overlay["explanation"] = (
+            f"{combined_risk_overlay.get('explanation', '')} "
+            f"Relative trend comparison uses {comparison_ticker} peer override."
+        ).strip()
+    else:
+        combined_risk_overlay["explanation"] = (
+            f"{combined_risk_overlay.get('explanation', '')} "
+            f"Relative trend comparison uses {comparison_ticker} benchmark."
+        ).strip()
 
 
 def _resolve_volume_volatility_presets(
@@ -2107,12 +2242,17 @@ def _render_relative_context_card(
     adjusted_exposure: float,
 ) -> None:
     st.subheader("Relative Context")
-    st.caption("Compares the ticker with the active benchmark and adds a small confirmation/caution read. It does not replace the core MR-1 score.")
+    comparison_ticker = relative_context.get("comparison_ticker") or relative_context.get("benchmark", "N/A")
+    comparison_type = relative_context.get("comparison_type", "Benchmark")
+    st.caption(
+        f"Compares the ticker with {comparison_ticker} ({comparison_type}) and adds a small confirmation/caution read. "
+        "It does not replace the core MR-1 score."
+    )
     status = relative_context.get("relationship_status", "Unavailable")
     score_adjustment = int(relative_context.get("score_adjustment", 0) or 0)
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Status", status)
-    col2.metric("Benchmark", relative_context.get("benchmark", "N/A"))
+    col2.metric("Comparison", f"{comparison_ticker} ({comparison_type})")
     col3.metric("Relative 20D", _format_optional_signed_pct(relative_context.get("relative_20d")))
     col4.metric("Score Impact", _format_signed_points(score_adjustment))
 
@@ -2144,6 +2284,8 @@ def _render_clean_relative_trend_card(clean_relative_trend: dict, show_chart: bo
 
     score = int(clean_relative_trend.get("score", 0))
     label = str(clean_relative_trend.get("label", "Unavailable"))
+    comparison_ticker = str(clean_relative_trend.get("comparison_ticker") or "Benchmark")
+    comparison_type = str(clean_relative_trend.get("comparison_type") or "Benchmark")
     status_class = _trend_quality_status_class(score)
     st.markdown(
         f"""
@@ -2152,7 +2294,7 @@ def _render_clean_relative_trend_card(clean_relative_trend: dict, show_chart: bo
                 <div>
                     <div class="volume-eyebrow">Clean Relative Trend</div>
                     <div class="volume-title">{score} / 100</div>
-                    <div class="volume-subtitle">{escape(label)} | {escape(str(clean_relative_trend.get("status", "Unavailable")))}</div>
+                    <div class="volume-subtitle">{escape(label)} | {escape(str(clean_relative_trend.get("status", "Unavailable")))} | vs {escape(comparison_ticker)} ({escape(comparison_type)})</div>
                 </div>
             </div>
             <p>{escape(str(clean_relative_trend.get("explanation", "")))}</p>
@@ -2185,11 +2327,11 @@ def _render_clean_relative_trend_card(clean_relative_trend: dict, show_chart: bo
             st.plotly_chart(
                 _relative_strength_quality_chart(clean_relative_trend),
                 width="stretch",
-                key=f"clean_relative_trend_chart_{clean_relative_trend.get('timeframe', 'tf')}",
+                key=f"clean_relative_trend_chart_{clean_relative_trend.get('timeframe', 'tf')}_{comparison_ticker}",
             )
 
 
-def _render_trend_quality_recommendation(clean_relative_trend: dict, benchmark: str) -> None:
+def _render_trend_quality_recommendation(clean_relative_trend: dict, comparison_ticker: str, comparison_type: str) -> None:
     st.subheader("Trend Quality")
     if not clean_relative_trend.get("available", False):
         st.info(clean_relative_trend.get("explanation", "Clean Relative Trend is unavailable."))
@@ -2197,12 +2339,12 @@ def _render_trend_quality_recommendation(clean_relative_trend: dict, benchmark: 
 
     score = int(clean_relative_trend.get("score", 0))
     label = clean_relative_trend.get("label", "Unavailable")
-    st.info(f"Clean Relative Trend Score: {score} / 100 - {label}")
+    st.info(f"Clean Relative Trend Score: {score} / 100 - {label}. Comparison: {comparison_ticker} ({comparison_type}).")
     st.write(clean_relative_trend.get("explanation", "Trend quality is unavailable."))
     guide = pd.DataFrame(
         [
-            ("Outperforming?", f"{int(clean_relative_trend.get('relative_trend_score', 0))} / {int(clean_relative_trend.get('relative_trend_max', 40))}", "Is the ticker leading the benchmark?"),
-            ("Stable enough?", f"{int(clean_relative_trend.get('relationship_stability_score', 0))} / {int(clean_relative_trend.get('relationship_stability_max', 30))}", f"Is the relationship with {benchmark} reliable enough to trust?"),
+            ("Outperforming?", f"{int(clean_relative_trend.get('relative_trend_score', 0))} / {int(clean_relative_trend.get('relative_trend_max', 40))}", f"Is the ticker leading {comparison_ticker}?"),
+            ("Stable enough?", f"{int(clean_relative_trend.get('relationship_stability_score', 0))} / {int(clean_relative_trend.get('relationship_stability_max', 30))}", f"Is the relationship with {comparison_ticker} reliable enough to trust?"),
             ("Volume confirms?", f"{int(clean_relative_trend.get('volume_confirmation_score', 0))} / {int(clean_relative_trend.get('volume_confirmation_max', 30))}", "Is participation supporting or contradicting the move?"),
         ],
         columns=["Question", "Score", "Read"],
@@ -2239,14 +2381,16 @@ def _render_overall_recommendation_summary(
     st.subheader("Overall Recommendation Summary")
     clean_score = int(clean_relative_trend.get("score", 0)) if clean_relative_trend.get("available") else None
     clean_label = str(clean_relative_trend.get("label", "Unavailable"))
-    relative_read = "Outperforming benchmark" if int(latest.get("Relative Strength Score", 0) or 0) > 0 else "Not outperforming benchmark"
+    trend_points = int(clean_relative_trend.get("relative_trend_score", 0) or 0)
+    trend_max = int(clean_relative_trend.get("relative_trend_max", 40) or 40)
+    relative_read = f"{trend_points} / {trend_max} trend points"
     rows = pd.DataFrame(
         [
             {"Layer": "MR-1 Score / Regime", "Read": f'{int(latest["MR-1 Score"])} / 100 - {latest["Regime"]}', "Takeaway": action},
             {"Layer": "Suggested Exposure", "Read": _format_pct(exposure), "Takeaway": "Position size guide from MR-1"},
             {"Layer": "Swing Score", "Read": f"{swing_result.score} / 100 - {swing_result.setup_label}", "Takeaway": swing_result.action},
             {"Layer": "Volume Context", "Read": str(latest.get("Volume Context", "Unavailable")), "Takeaway": f'{int(latest.get("Volume Adjustment", 0) or 0):+d} MR-1 points'},
-            {"Layer": f"Relative Strength vs {benchmark}", "Read": relative_read, "Takeaway": f'{int(latest.get("Relative Strength Score", 0) or 0)} signal points'},
+            {"Layer": f"Relative Strength vs {benchmark}", "Read": relative_read, "Takeaway": clean_relative_trend.get("status", "Unavailable")},
             {"Layer": "Clean Relative Trend", "Read": "Unavailable" if clean_score is None else f"{clean_score} / 100 - {clean_label}", "Takeaway": clean_relative_trend.get("status", "Unavailable")},
         ]
     )
@@ -2264,8 +2408,8 @@ def _overall_recommendation_conclusion(
 ) -> str:
     regime = str(latest.get("Regime", "Unavailable"))
     volume_context = str(latest.get("Volume Context", "Unavailable"))
-    relative_positive = int(latest.get("Relative Strength Score", 0) or 0) > 0
     clean_score = int(clean_relative_trend.get("score", 0)) if clean_relative_trend.get("available") else 0
+    relative_positive = int(clean_relative_trend.get("relative_trend_score", 0) or 0) >= 25
 
     if regime == "Risk-On" and clean_score >= 80 and swing_result.score >= 70:
         return (
@@ -2304,7 +2448,9 @@ def _render_relative_context_detail(relative_context: dict) -> None:
     col1.metric("Status", relative_context.get("relationship_status", "Unavailable"))
     col2.metric("Confidence", relative_context.get("confidence", "Low"))
     col3.metric("Score Impact", _format_signed_points(int(relative_context.get("score_adjustment", 0) or 0)))
-    col4.metric("Benchmark", relative_context.get("benchmark", "N/A"))
+    comparison_ticker = relative_context.get("comparison_ticker") or relative_context.get("benchmark", "N/A")
+    comparison_type = relative_context.get("comparison_type", "Benchmark")
+    col4.metric("Comparison", f"{comparison_ticker} ({comparison_type})")
 
     col5, col6, col7, col8 = st.columns(4)
     col5.metric("5D Relative", _format_optional_signed_pct(relative_context.get("relative_5d")))
@@ -2325,9 +2471,9 @@ def _render_relative_context_detail(relative_context: dict) -> None:
             )
             _render_relative_chart_explanation(
                 "Relative Strength Ratio",
-                "Shows the ticker divided by the benchmark. Rising means the ticker is leading the benchmark; falling means it is lagging.",
-                "Best use: confirm whether price strength is real leadership or just broad-market lift.",
-                "Watch out: a stock can rise while this line falls, meaning it is still underperforming the benchmark.",
+                "Shows the ticker divided by the selected comparison. Rising means the ticker is leading; falling means it is lagging.",
+                "Best use: confirm whether price strength is real leadership versus the benchmark or selected peer.",
+                "Watch out: a stock can rise while this line falls, meaning it is still underperforming the comparison ticker.",
             )
         with c2:
             st.plotly_chart(
@@ -2350,8 +2496,8 @@ def _render_relative_context_detail(relative_context: dict) -> None:
             )
             _render_relative_chart_explanation(
                 "Relationship Stability",
-                "Shows how closely the ticker and benchmark move together across tactical and broader windows.",
-                "Best use: decide whether the selected benchmark is a valid comparison for this ticker.",
+                "Shows how closely the ticker and selected comparison move together across tactical and broader windows.",
+                "Best use: decide whether the benchmark or peer is a valid comparison for this ticker.",
                 "Watch out: falling or low correlation means relative-strength signals deserve less confidence.",
             )
         with c4:
@@ -2362,8 +2508,8 @@ def _render_relative_context_detail(relative_context: dict) -> None:
             )
             _render_relative_chart_explanation(
                 "Market Sensitivity",
-                "Shows how much the ticker tends to move for a benchmark move.",
-                "Best use: position sizing and risk. Higher beta means larger swings versus the benchmark.",
+                "Shows how much the ticker tends to move for a comparison-ticker move.",
+                "Best use: position sizing and risk. Higher beta means larger swings versus the selected comparison.",
                 "Watch out: rising beta can improve upside in Risk-On regimes but increases drawdown risk when the market weakens.",
             )
 
@@ -2372,10 +2518,10 @@ def _render_relative_context_detail(relative_context: dict) -> None:
         width="stretch",
         key=f"relative_rvol_{relative_context.get('ticker')}_{relative_context.get('benchmark')}",
     )
-    st.caption("Relative volume compares current ticker participation with benchmark participation. Strong ticker RVOL can confirm a relative-strength move.")
+    st.caption("Relative volume compares current ticker participation with comparison-ticker participation. Strong ticker RVOL can confirm a relative-strength move.")
     _render_relative_chart_explanation(
-        "Ticker vs Benchmark Relative Volume",
-        "Compares current participation in the ticker against participation in the benchmark.",
+        "Ticker vs Comparison Relative Volume",
+        "Compares current participation in the ticker against participation in the selected comparison.",
         "Best use: confirmation. Strong ticker RVOL supports a relative-strength move when price leadership is already present.",
         "Watch out: high RVOL on down moves can be distribution, not confirmation.",
     )
@@ -2407,10 +2553,11 @@ def _render_relative_chart_explanation(title: str, meaning: str, best_use: str, 
 
 def _render_relative_context_explainer(relative_context: dict) -> None:
     ticker = str(relative_context.get("ticker") or "Ticker").upper()
-    benchmark = str(relative_context.get("benchmark") or "Benchmark").upper()
+    benchmark = str(relative_context.get("comparison_ticker") or relative_context.get("benchmark") or "Comparison").upper()
+    comparison_type = str(relative_context.get("comparison_type") or "Benchmark")
     st.markdown("**How to read this tab**")
     st.caption(
-        f"Relative Context asks whether {ticker} is acting better or worse than {benchmark}. "
+        f"Relative Context asks whether {ticker} is acting better or worse than {benchmark} ({comparison_type}). "
         "Use it as confirmation and timing context, not as a standalone buy/sell signal."
     )
     guide = pd.DataFrame(
@@ -2418,7 +2565,7 @@ def _render_relative_context_explainer(relative_context: dict) -> None:
             (
                 "Status",
                 "Overall relationship read: Supportive, Neutral, Warning, Broken, or Unavailable.",
-                "Supportive can reinforce a long setup. Warning/Broken says the benchmark comparison is not confirming cleanly.",
+                "Supportive can reinforce a long setup. Warning/Broken says the selected comparison is not confirming cleanly.",
             ),
             (
                 "Score Impact",
@@ -2437,13 +2584,13 @@ def _render_relative_context_explainer(relative_context: dict) -> None:
             ),
             (
                 "Relationship Stability",
-                "Ticker/benchmark correlation across tactical windows plus YTD and 52W context.",
-                "Stable/high readings make the benchmark useful. Weak/falling readings mean the ticker may be trading on its own drivers.",
+                "Ticker/comparison correlation across tactical windows plus YTD and 52W context.",
+                "Stable/high readings make the selected comparison useful. Weak/falling readings mean the ticker may be trading on its own drivers.",
             ),
             (
                 "Beta Trend",
-                "How sensitive the ticker has been to benchmark moves.",
-                "Rising/high beta means larger swings versus the benchmark. Falling/low beta means less market sensitivity.",
+                "How sensitive the ticker has been to selected-comparison moves.",
+                "Rising/high beta means larger swings versus the comparison. Falling/low beta means less comparison sensitivity.",
             ),
             (
                 "Volume Confirmation",
@@ -2711,6 +2858,8 @@ def _render_recommendation(
     swing_result: SwingResult,
     clean_relative_trend: dict,
     combined_risk_overlay: dict,
+    comparison_ticker: str,
+    comparison_type: str,
 ) -> None:
     action = _recommendation_action(latest_score, latest_regime)
     confidence = _confidence_label(latest_score, signals)
@@ -2738,11 +2887,15 @@ def _render_recommendation(
         st.write(paragraph)
 
     if RELATIVE_TREND_QUALITY_CONFIG.get("show_in_recommendation", True):
-        _render_trend_quality_recommendation(clean_relative_trend, benchmark=benchmark)
+        _render_trend_quality_recommendation(
+            clean_relative_trend,
+            comparison_ticker=comparison_ticker,
+            comparison_type=comparison_type,
+        )
 
     _render_overall_recommendation_summary(
         ticker=ticker,
-        benchmark=benchmark,
+        benchmark=comparison_ticker,
         latest=scored.iloc[-1],
         action=action,
         exposure=exposure,
@@ -3693,32 +3846,35 @@ def _options_iv_chart(options_context: OptionsVolatilityResult | None) -> go.Fig
 
 def _relative_ratio_chart(history: pd.DataFrame, relative_context: dict) -> go.Figure:
     fig = go.Figure()
+    ticker = relative_context.get("ticker", "Ticker")
+    comparison = relative_context.get("comparison_ticker") or relative_context.get("benchmark", "Comparison")
     if history.empty or "Relative Ratio" not in history.columns:
         fig.add_annotation(text="Not enough data available.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
-        return _finish_chart(fig, title="Relative Strength Ratio")
+        return _finish_chart(fig, title=f"{ticker} / {comparison} Relative Strength")
     fig.add_trace(
         go.Scatter(
             x=history.index,
             y=history["Relative Ratio"],
-            name=f"{relative_context.get('ticker')} / {relative_context.get('benchmark')}",
+            name=f"{ticker} / {comparison}",
             line=dict(color="#38bdf8", width=2.5),
         )
     )
-    return _finish_chart(fig, title="Relative Strength Ratio")
+    return _finish_chart(fig, title=f"{ticker} / {comparison} Relative Strength")
 
 
 def _relative_strength_quality_chart(clean_relative_trend: dict) -> go.Figure:
     fig = go.Figure()
     history = clean_relative_trend.get("history")
+    comparison_ticker = str(clean_relative_trend.get("comparison_ticker") or "Benchmark")
     if history is None or history.empty or "Relative Ratio" not in history.columns:
         fig.add_annotation(text="Not enough data available.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
-        return _finish_chart(fig, title="Relative Strength Quality")
+        return _finish_chart(fig, title=f"Relative Strength Quality vs {comparison_ticker}")
 
     fig.add_trace(
         go.Scatter(
             x=history.index,
             y=history["Relative Ratio"],
-            name="Ticker / Benchmark ratio",
+            name=f"Ticker / {comparison_ticker} ratio",
             line=dict(color="#38bdf8", width=2.6),
         )
     )
@@ -3777,7 +3933,7 @@ def _relative_strength_quality_chart(clean_relative_trend: dict) -> go.Figure:
         bordercolor="rgba(148, 163, 184, 0.26)",
         borderpad=6,
     )
-    return _finish_chart(fig, title="Relative Strength Quality")
+    return _finish_chart(fig, title=f"Relative Strength Quality vs {comparison_ticker}")
 
 
 def _relative_zscore_chart(history: pd.DataFrame) -> go.Figure:
@@ -3837,17 +3993,18 @@ def _relative_beta_chart(history: pd.DataFrame) -> go.Figure:
 
 def _relative_rvol_chart(relative_context: dict) -> go.Figure:
     fig = go.Figure()
+    comparison = relative_context.get("comparison_ticker") or relative_context.get("benchmark", "Comparison")
     values = [
         relative_context.get("ticker_rvol_20d"),
         relative_context.get("benchmark_rvol_20d"),
     ]
     labels = [
         f"{relative_context.get('ticker', 'Ticker')} RVOL",
-        f"{relative_context.get('benchmark', 'Benchmark')} RVOL",
+        f"{comparison} RVOL",
     ]
     if all(value is None or pd.isna(value) for value in values):
-        fig.add_annotation(text="Ticker vs benchmark RVOL is unavailable.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
-        return _finish_chart(fig, title="Ticker vs Benchmark Relative Volume")
+        fig.add_annotation(text="Ticker vs comparison RVOL is unavailable.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        return _finish_chart(fig, title="Ticker vs Comparison Relative Volume")
     fig.add_trace(
         go.Bar(
             x=labels,
@@ -3857,7 +4014,7 @@ def _relative_rvol_chart(relative_context: dict) -> go.Figure:
         )
     )
     fig.add_hline(y=1.2, line=dict(color="#f59e0b", width=1.2, dash="dash"), annotation_text="Elevated")
-    return _finish_chart(fig, title="Ticker vs Benchmark Relative Volume")
+    return _finish_chart(fig, title="Ticker vs Comparison Relative Volume")
 
 
 def _regime_time_spent_chart(regime_persistence: RegimePersistenceResult | None) -> go.Figure:

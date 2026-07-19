@@ -15,6 +15,24 @@ DEFAULT_BENCHMARK = "SPY"
 BENCHMARKS = ["SPY", "QQQ"]
 HMM_TICKERS = ["SPY", "QQQ", "IWM", "RSP", "^VIX", "XLK", "XLU", "HYG", "TLT"]
 
+PEER_OVERRIDE_CONFIG = {
+    "enabled": True,
+    "default_mode": "Auto",
+    "allow_custom_ticker": True,
+    "fallback_to_benchmark": True,
+    "min_required_rows": 60,
+}
+
+PEER_GROUPS = {
+    "AMD": ["NVDA", "AVGO", "INTC", "MU", "SMH", "SOXX"],
+    "NVDA": ["AMD", "AVGO", "MRVL", "MU", "SMH", "SOXX"],
+    "AAPL": ["MSFT", "GOOGL", "AMZN", "META", "QQQ"],
+    "MSFT": ["AAPL", "GOOGL", "AMZN", "META", "QQQ"],
+    "TSLA": ["RIVN", "LCID", "GM", "F", "XLY"],
+    "SPY": ["QQQ", "IWM", "DIA", "RSP"],
+    "QQQ": ["SPY", "IWM", "DIA", "XLK"],
+}
+
 RELATIVE_CONTEXT_CONFIG = {
     "enabled": True,
     "default_benchmark": "SPY",

@@ -215,7 +215,7 @@ def classify_relationship_status(metrics: dict) -> dict:
         status = "Broken"
         adjustment = -5
         confidence = "Low"
-        warnings.append("Benchmark confirmation is unreliable because the relationship is unstable.")
+        warnings.append("Comparison confirmation is unreliable because the relationship is unstable.")
     elif trend == "Improving" and volume == "Confirmed" and extension != "Strongly extended":
         status = "Supportive"
         adjustment = 8 if corr == "Stable" else 5
@@ -239,7 +239,7 @@ def classify_relationship_status(metrics: dict) -> dict:
         status = "Warning"
         adjustment = -5
         confidence = "Low"
-        warnings.append("Benchmark relationship is weakening.")
+        warnings.append("Comparison relationship is weakening.")
 
     if extension == "Strongly extended":
         warnings.append("Relative move is strongly extended; avoid chasing.")
@@ -287,7 +287,7 @@ def build_relative_context_summary(metrics: dict) -> str:
     if status == "Broken":
         return (
             f"{ticker} is no longer moving consistently with {benchmark}. "
-            "That does not automatically mean bearish, but benchmark confirmation is unreliable."
+            "That does not automatically mean bearish, but comparison confirmation is unreliable."
         )
     if status == "Neutral":
         return (

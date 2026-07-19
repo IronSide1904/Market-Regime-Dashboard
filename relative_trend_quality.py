@@ -61,13 +61,13 @@ def score_relative_trend_strength(
     score = min(score, weight)
 
     if outperforming:
-        drivers.append("Ticker is outperforming benchmark")
+        drivers.append("Ticker is outperforming the selected comparison")
     if above_ma:
         drivers.append("Relative strength ratio is above its average")
     if rising_ratio:
         drivers.append("Relative strength ratio is rising")
     if positives == 0:
-        warnings.append("Ticker is not outperforming the benchmark over the selected timeframe.")
+        warnings.append("Ticker is not outperforming the selected comparison over the selected timeframe.")
 
     return _component(
         "Relative trend strength scored.",
@@ -141,10 +141,10 @@ def score_relationship_stability(
 
     if strong:
         score = weight
-        drivers.append("Ticker/benchmark relationship is stable")
+        drivers.append("Ticker/comparison relationship is stable")
     elif moderate:
         score = 20
-        drivers.append("Ticker/benchmark relationship is mostly stable")
+        drivers.append("Ticker/comparison relationship is mostly stable")
         warnings.append("Correlation stability is moderate, not strong.")
     elif corr_short is not None and corr_short > 0:
         score = 10
@@ -431,8 +431,8 @@ def _status(label: str) -> str:
 def _explanation(score: int, label: str, trend: dict, stability: dict, volume: dict) -> str:
     if score >= 80:
         return (
-            "The ticker is outperforming the benchmark with a rising relative-strength profile, "
-            "the benchmark relationship is stable enough to trust, and volume is confirming the move."
+            "The ticker is outperforming the selected comparison with a rising relative-strength profile, "
+            "the comparison relationship is stable enough to trust, and volume is confirming the move."
         )
     if score >= 60:
         return (
