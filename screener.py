@@ -702,6 +702,15 @@ def _render_screener_results(
             theme_name=controls.get("detected_theme"),
         )
 
+    render_bucket_analysis_section(
+        results_df=scored,
+        target_ticker=controls.get("target_ticker"),
+        ticker_data=ticker_data,
+        benchmark=controls["benchmark"],
+        market_benchmark=controls["market_benchmark"],
+        timeframe=controls["timeframe"],
+    )
+
     col_a, col_b, col_c = st.columns(3)
     col_a.metric("Screened", f"{len(scored)}")
     col_b.metric("Shown", f"{len(sorted_df)}")
@@ -717,14 +726,6 @@ def _render_screener_results(
 
     if sorted_df.empty:
         st.warning("No tickers passed the selected filters.")
-        render_bucket_analysis_section(
-            results_df=scored,
-            target_ticker=controls.get("target_ticker"),
-            ticker_data=ticker_data,
-            benchmark=controls["benchmark"],
-            market_benchmark=controls["market_benchmark"],
-            timeframe=controls["timeframe"],
-        )
         return
 
     display_df = _display_columns(sorted_df, include_target=controls.get("mode") == "Ticker Comparison")
@@ -753,15 +754,6 @@ def _render_screener_results(
         )
 
     _render_selected_ticker_preview(sorted_df, timeframe=controls["timeframe"], benchmark=controls["benchmark"])
-
-    render_bucket_analysis_section(
-        results_df=scored,
-        target_ticker=controls.get("target_ticker"),
-        ticker_data=ticker_data,
-        benchmark=controls["benchmark"],
-        market_benchmark=controls["market_benchmark"],
-        timeframe=controls["timeframe"],
-    )
 
     with st.expander("Advanced screener columns", expanded=False):
         st.dataframe(
