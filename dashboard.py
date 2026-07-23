@@ -68,7 +68,8 @@ from scoring import (
     get_regime,
 )
 from swing import SwingResult, build_swing_result
-from volume import get_timeframe_config, resolve_share_count_for_turnover
+from turnover import resolve_share_count_for_turnover
+from volume import get_timeframe_config
 
 
 KNOWN_ETF_SYMBOLS = {

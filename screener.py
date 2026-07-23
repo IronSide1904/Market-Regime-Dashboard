@@ -23,7 +23,7 @@ from config import (
 )
 from data import normalize_ticker
 from finviz_fetcher import configured_finviz_columns, fetch_finviz_export, normalize_finviz_dataframe, remove_dead_local_proxy
-from volume import calculate_turnover_metrics, resolve_share_count_for_turnover
+from turnover import calculate_turnover_metrics, resolve_share_count_for_turnover
 
 
 SCREENER_TIMEFRAME_WINDOWS = {
