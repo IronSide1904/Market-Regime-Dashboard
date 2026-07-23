@@ -15,6 +15,7 @@ from config import (
     SCREENER_BUCKET_CHART_OPTIONS,
     SCREENER_CONFIG,
     SCREENER_PEER_MAP,
+    SCREENER_PEER_OVERRIDE_CONFIG,
     SCREENER_TARGET_TICKER_CONFIG,
     SCREENER_THEME_GROUPS,
     SCREENER_WATCHLISTS,
@@ -72,6 +73,151 @@ def normalize_ticker_list(raw_input: str | list[str]) -> list[str]:
         if ticker and ticker not in tickers:
             tickers.append(ticker)
     return tickers
+
+
+def parse_peer_override_input(raw_text: str) -> list[str]:
+    """
+    Parse sidebar peer override input.
+    Clean, uppercase, deduplicate, and return valid tickers.
+    """
+    tickers = normalize_ticker_list(raw_text or "")
+    max_tickers = int(SCREENER_PEER_OVERRIDE_CONFIG.get("max_override_tickers", 50))
+    return tickers[:max_tickers]
+
+
+def apply_peer_override_to_buckets(
+    buckets: dict,
+    override_tickers: list[str],
+    apply_to: list[str],
+    mode: str = "append",
+    target_ticker: str | None = None,
+    benchmarks: list[str] | None = None,
+) -> dict:
+    """
+    Apply sidebar peer override to Direct Peers, Sector Peers, and Industry Peers.
+
+    mode='append':
+        Add override tickers to existing bucket tickers.
+
+    mode='replace':
+        Replace existing bucket tickers with override tickers.
+
+    Always preserve target ticker and benchmarks where required.
+    """
+    final_buckets = {normalize_ticker(ticker): list(labels) for ticker, labels in (buckets or {}).items() if normalize_ticker(ticker)}
+    override = normalize_ticker_list(override_tickers)
+    mode = mode if mode in SCREENER_PEER_OVERRIDE_CONFIG.get("allowed_modes", ["append", "replace"]) else "append"
+    bucket_label_map = {
+        "Direct Peers": "Direct Peer",
+        "Sector Peers": "Sector Peer",
+        "Industry Peers": "Industry Peer",
+    }
+    selected_labels = [bucket_label_map[label] for label in apply_to if label in bucket_label_map]
+
+    if mode == "replace" and selected_labels:
+        for ticker, labels in list(final_buckets.items()):
+            final_buckets[ticker] = [label for label in labels if label not in selected_labels]
+            if not final_buckets[ticker]:
+                final_buckets.pop(ticker, None)
+
+    for ticker in override:
+        if normalize_ticker(ticker) == normalize_ticker(target_ticker or ""):
+            continue
+        labels = final_buckets.setdefault(ticker, [])
+        for label in selected_labels:
+            if label not in labels:
+                labels.append(label)
+
+    if SCREENER_PEER_OVERRIDE_CONFIG.get("always_include_target", True):
+        target = normalize_ticker(target_ticker or "")
+        if target:
+            labels = final_buckets.setdefault(target, [])
+            if "Target" not in labels:
+                labels.insert(0, "Target")
+
+    if SCREENER_PEER_OVERRIDE_CONFIG.get("always_include_benchmarks", True):
+        clean_benchmarks = normalize_ticker_list(benchmarks or [])
+        for index, benchmark in enumerate(clean_benchmarks):
+            label = "Benchmark" if index == 0 else "Market Benchmark"
+            labels = final_buckets.setdefault(benchmark, [])
+            if label not in labels:
+                labels.append(label)
+
+    return final_buckets
+
+
+def build_final_comparison_universe(
+    target_ticker: str,
+    auto_buckets: dict,
+    peer_override_enabled: bool,
+    peer_override_tickers: list[str],
+    peer_override_mode: str,
+    peer_override_apply_to: list[str],
+    benchmark: str,
+    market_benchmark: str,
+) -> dict:
+    """
+    Build the final screener universe after applying sidebar overrides.
+    This final universe must be used by tables, charts, medians, ranks, and overlay calculations.
+    """
+    base_buckets = {normalize_ticker(ticker): list(labels) for ticker, labels in (auto_buckets or {}).items() if normalize_ticker(ticker)}
+    override = normalize_ticker_list(peer_override_tickers)
+    metadata = {
+        ticker: {
+            "bucket_source": "auto_detected",
+            "override_applied": False,
+            "override_mode": "",
+        }
+        for ticker in base_buckets
+    }
+
+    if peer_override_enabled and override:
+        final_buckets = apply_peer_override_to_buckets(
+            buckets=base_buckets,
+            override_tickers=override,
+            apply_to=peer_override_apply_to,
+            mode=peer_override_mode,
+            target_ticker=target_ticker,
+            benchmarks=[benchmark, market_benchmark],
+        )
+        override_set = set(override)
+        for ticker in final_buckets:
+            was_auto = ticker in base_buckets
+            used_override = ticker in override_set
+            metadata[ticker] = {
+                "bucket_source": "auto_detected + sidebar_override" if was_auto and used_override else "sidebar_override" if used_override else "auto_detected",
+                "override_applied": bool(used_override),
+                "override_mode": peer_override_mode if used_override else "",
+            }
+    else:
+        final_buckets = apply_peer_override_to_buckets(
+            buckets=base_buckets,
+            override_tickers=[],
+            apply_to=[],
+            mode="append",
+            target_ticker=target_ticker,
+            benchmarks=[benchmark, market_benchmark],
+        )
+        for ticker in final_buckets:
+            metadata.setdefault(
+                ticker,
+                {
+                    "bucket_source": "auto_detected",
+                    "override_applied": False,
+                    "override_mode": "",
+                },
+            )
+
+    tickers = normalize_ticker_list(list(final_buckets.keys()))
+    return {
+        "tickers": tickers,
+        "buckets": final_buckets,
+        "bucket_metadata": metadata,
+        "override_enabled": bool(peer_override_enabled and override),
+        "override_tickers": override,
+        "override_mode": peer_override_mode,
+        "override_apply_to": peer_override_apply_to,
+    }
 
 
 def build_ticker_comparison_universe(
@@ -230,13 +376,13 @@ def calculate_screener_features(
     timeframe: str,
     metadata: dict | None = None,
 ) -> pd.DataFrame:
-    del metadata
     window = SCREENER_TIMEFRAME_WINDOWS.get(timeframe, 21)
     benchmark_symbol = str(benchmark_data.get("benchmark_symbol", SCREENER_CONFIG["default_benchmark"]))
     market_symbol = str(benchmark_data.get("market_symbol", SCREENER_CONFIG["default_market_benchmark"]))
     target_symbol = normalize_ticker(str(benchmark_data.get("target_symbol", "")))
     include_benchmarks = bool(benchmark_data.get("include_benchmarks", False))
     buckets = benchmark_data.get("buckets", {}) or {}
+    bucket_metadata = benchmark_data.get("bucket_metadata", {}) or {}
     benchmark_return = _timeframe_return(benchmark_data.get("benchmark"), window)
     market_return = _timeframe_return(benchmark_data.get("market"), window)
     target_return = _timeframe_return(ticker_data.get(target_symbol), window) if target_symbol else np.nan
@@ -255,6 +401,10 @@ def calculate_screener_features(
         )
         if row:
             row["Bucket"] = _bucket_label(buckets.get(ticker, []))
+            ticker_metadata = bucket_metadata.get(ticker, {})
+            row["Bucket Source"] = ticker_metadata.get("bucket_source", "auto_detected" if ticker in buckets else "universe")
+            row["Override Applied"] = bool(ticker_metadata.get("override_applied", False))
+            row["Override Mode"] = ticker_metadata.get("override_mode", "")
             rows.append(row)
 
     if not rows:
@@ -267,14 +417,19 @@ def calculate_screener_features(
     features["RS vs Theme"] = features["Timeframe Return"] - theme_median
     features["RS vs Target"] = features["Timeframe Return"] - target_return if math.isfinite(float(target_return)) else np.nan
     features["RS Composite"] = features[["RS vs Benchmark", "RS vs SPY", "RS vs Theme"]].mean(axis=1)
+    bucket_medians = _bucket_return_medians(features)
+    features["Peer Median Return"] = bucket_medians.get("Direct Peer", np.nan)
+    features["Sector Median Return"] = bucket_medians.get("Sector Peer", np.nan)
+    features["Industry Median Return"] = bucket_medians.get("Industry Peer", np.nan)
+    features["RS vs Peer Median"] = features["Timeframe Return"] - features["Peer Median Return"]
+    features["RS vs Sector"] = features["Timeframe Return"] - features["Sector Median Return"]
+    features["RS vs Industry"] = features["Timeframe Return"] - features["Industry Median Return"]
     features["Momentum Percentile"] = features["Timeframe Return"].rank(pct=True)
     features["RS Percentile"] = features["RS Composite"].rank(pct=True)
     features["Theme Percentile"] = features["Timeframe Return"].rank(pct=True)
     features["Sector"] = None
     features["Industry"] = None
     features["Company"] = None
-    features["RS vs Sector"] = np.nan
-    features["RS vs Industry"] = np.nan
     features["Confidence"] = "Medium"
     if "Bucket" not in features.columns:
         features["Bucket"] = "Universe"
@@ -425,8 +580,8 @@ def render_screener_tab() -> None:
         if SCREENER_BUCKET_ANALYSIS_CONFIG.get("enabled", True):
             st.subheader("Bucket Analysis")
             st.info(
-                "Run the screener to populate Target, Direct Peers, Theme Peers, Benchmarks, "
-                "bucket charts, and the All Buckets Overlay."
+                "Run the screener to populate Target, Direct Peers, Sector Peers, Industry Peers, "
+                "Theme Peers, Benchmarks, bucket charts, and the All Buckets Overlay."
             )
         return
 
@@ -457,6 +612,7 @@ def render_screener_tab() -> None:
             "target_symbol": controls.get("target_ticker", ""),
             "include_benchmarks": controls.get("include_benchmarks", False),
             "buckets": controls.get("buckets", {}),
+            "bucket_metadata": controls.get("bucket_metadata", {}),
         },
         theme_tickers=controls.get("theme_tickers", universe_tickers),
         timeframe=controls["timeframe"],
@@ -627,12 +783,63 @@ def _render_screener_controls() -> dict:
 
     comparison_tickers = normalize_ticker_list(comparison_tickers_text)
     buckets = {ticker: list(values) for ticker, values in (target_universe.get("buckets", {}) or {}).items()}
+    peer_override_enabled = bool(
+        st.session_state.get(
+            "screener_peer_override_enabled",
+            SCREENER_PEER_OVERRIDE_CONFIG.get("default_enabled", False),
+        )
+    )
+    peer_override_tickers = parse_peer_override_input(str(st.session_state.get("screener_peer_override_text", "")))
+    peer_override_mode = str(
+        st.session_state.get(
+            "screener_peer_override_mode",
+            SCREENER_PEER_OVERRIDE_CONFIG.get("default_mode", "append"),
+        )
+    ).lower()
+    allowed_override_modes = SCREENER_PEER_OVERRIDE_CONFIG.get("allowed_modes", ["append", "replace"])
+    if peer_override_mode not in allowed_override_modes:
+        peer_override_mode = str(SCREENER_PEER_OVERRIDE_CONFIG.get("default_mode", "append"))
+    peer_override_apply_to = [
+        value
+        for value in st.session_state.get(
+            "screener_peer_override_apply_to",
+            SCREENER_PEER_OVERRIDE_CONFIG.get("default_apply_to", ["Direct Peers", "Sector Peers", "Industry Peers"]),
+        )
+        if value in {"Direct Peers", "Sector Peers", "Industry Peers"}
+    ]
+    if not peer_override_apply_to:
+        peer_override_apply_to = list(SCREENER_PEER_OVERRIDE_CONFIG.get("default_apply_to", ["Direct Peers", "Sector Peers", "Industry Peers"]))
+
     if mode == "Ticker Comparison":
         buckets.setdefault(target_ticker, ["Target"])
         buckets.setdefault(benchmark or str(SCREENER_CONFIG["default_benchmark"]), ["Benchmark"])
         buckets.setdefault(market_benchmark or str(SCREENER_CONFIG["default_market_benchmark"]), ["Market Benchmark"])
         for ticker in comparison_tickers:
             buckets.setdefault(ticker, ["Manual Override"])
+        final_universe = build_final_comparison_universe(
+            target_ticker=target_ticker,
+            auto_buckets=buckets,
+            peer_override_enabled=peer_override_enabled,
+            peer_override_tickers=peer_override_tickers,
+            peer_override_mode=peer_override_mode,
+            peer_override_apply_to=peer_override_apply_to,
+            benchmark=benchmark or str(SCREENER_CONFIG["default_benchmark"]),
+            market_benchmark=market_benchmark or str(SCREENER_CONFIG["default_market_benchmark"]),
+        )
+        comparison_tickers = final_universe["tickers"]
+        buckets = final_universe["buckets"]
+        bucket_metadata = final_universe["bucket_metadata"]
+    else:
+        final_universe = {
+            "tickers": comparison_tickers,
+            "buckets": buckets,
+            "bucket_metadata": {},
+            "override_enabled": False,
+            "override_tickers": peer_override_tickers,
+            "override_mode": peer_override_mode,
+            "override_apply_to": peer_override_apply_to,
+        }
+        bucket_metadata = {}
     if mode == "Sector / Industry Screener":
         st.caption("Sector / Industry Screener currently uses sector ETFs as a lightweight universe. Stock sector/industry peer expansion can be enhanced with Finviz metadata later.")
 
@@ -645,12 +852,17 @@ def _render_screener_controls() -> dict:
         market_benchmark=market_benchmark or str(SCREENER_CONFIG["default_market_benchmark"]),
         timeframe=timeframe,
         filters={"min_price": float(min_price), "min_dollar_volume": float(min_dollar_volume), "top_n": int(top_n)},
+        peer_override_enabled=peer_override_enabled,
+        peer_override_tickers=peer_override_tickers,
+        peer_override_mode=peer_override_mode,
+        peer_override_apply_to=peer_override_apply_to,
     )
     with st.expander("Save / load screener preset", expanded=False):
         uploaded = st.file_uploader("Load preset JSON", type=["json"], key="screener_preset_upload")
         if uploaded is not None:
             try:
                 st.session_state["screener_loaded_preset"] = json.loads(uploaded.getvalue().decode("utf-8"))
+                st.session_state["screener_apply_loaded_preset"] = True
                 st.success("Preset loaded. The controls will update on the next rerun.")
             except Exception as exc:
                 st.warning(f"Could not load preset: {exc}")
@@ -667,9 +879,15 @@ def _render_screener_controls() -> dict:
         "target_universe": target_universe,
         "detected_theme": target_universe.get("theme") or theme,
         "buckets": buckets,
+        "bucket_metadata": bucket_metadata,
+        "final_universe": final_universe,
         "comparison_tickers": comparison_tickers,
         "include_benchmarks": mode == "Ticker Comparison" and bool(SCREENER_TARGET_TICKER_CONFIG.get("include_benchmarks_in_results", True)),
         "theme_tickers": normalize_ticker_list(SCREENER_THEME_GROUPS.get(target_universe.get("theme") or theme, [])),
+        "peer_override_enabled": peer_override_enabled,
+        "peer_override_tickers": peer_override_tickers,
+        "peer_override_mode": peer_override_mode,
+        "peer_override_apply_to": peer_override_apply_to,
         "theme": theme,
         "watchlist": watchlist,
         "manual_tickers": manual_tickers,
@@ -706,12 +924,19 @@ def _render_comparison_universe_preview(controls: dict) -> None:
     universe = controls.get("target_universe", {})
     tickers = normalize_ticker_list(controls.get("comparison_tickers", []))
     target = controls.get("target_ticker") or universe.get("target")
+    override_note = ""
+    if controls.get("peer_override_enabled") and controls.get("peer_override_tickers"):
+        override_note = (
+            f" | Peer override: {controls.get('peer_override_mode', 'append')} "
+            f"to {', '.join(controls.get('peer_override_apply_to', []))}"
+        )
     st.info(
         f"**{target} comparison universe** | "
         f"Detected theme: {universe.get('theme') or 'Not detected'} | "
         f"Sector: {universe.get('sector') or 'Unavailable'} | "
         f"Industry: {universe.get('industry') or 'Unavailable'} | "
         f"Benchmark: {controls['benchmark']} | Market: {controls['market_benchmark']}"
+        f"{override_note}"
     )
     st.caption(f"{target} will be compared against: {', '.join(tickers)}")
 
@@ -755,6 +980,10 @@ def _build_preset_payload(
     market_benchmark: str,
     timeframe: str,
     filters: dict,
+    peer_override_enabled: bool = False,
+    peer_override_tickers: list[str] | None = None,
+    peer_override_mode: str = "append",
+    peer_override_apply_to: list[str] | None = None,
 ) -> dict:
     return {
         "mode": mode,
@@ -765,12 +994,27 @@ def _build_preset_payload(
         "market_benchmark": market_benchmark,
         "timeframe": timeframe,
         "filters": filters,
+        "peer_override_enabled": bool(peer_override_enabled),
+        "peer_override_tickers": normalize_ticker_list(peer_override_tickers or []),
+        "peer_override_mode": peer_override_mode,
+        "peer_override_apply_to": list(peer_override_apply_to or []),
     }
 
 
 def _bucket_label(buckets: list[str] | tuple[str, ...] | None) -> str:
     values = [str(bucket) for bucket in (buckets or []) if str(bucket)]
     return " / ".join(values) if values else "Universe"
+
+
+def _bucket_return_medians(features: pd.DataFrame) -> dict[str, float]:
+    medians: dict[str, float] = {}
+    if features.empty or "Bucket" not in features.columns or "Timeframe Return" not in features.columns:
+        return medians
+    for bucket in ["Direct Peer", "Sector Peer", "Industry Peer"]:
+        mask = features["Bucket"].astype(str).str.split(" / ").apply(lambda labels: bucket in labels)
+        values = pd.to_numeric(features.loc[mask, "Timeframe Return"], errors="coerce").dropna()
+        medians[bucket] = float(values.median()) if not values.empty else np.nan
+    return medians
 
 
 def _build_feature_row(
@@ -931,7 +1175,6 @@ def group_screener_results_by_bucket(results_df: pd.DataFrame) -> dict[str, pd.D
 
 
 def render_bucket_table(bucket_name: str, bucket_df: pd.DataFrame) -> None:
-    del bucket_name
     if bucket_df.empty:
         st.info("No tickers in this bucket.")
         return
@@ -941,6 +1184,15 @@ def render_bucket_table(bucket_name: str, bucket_df: pd.DataFrame) -> None:
         hide_index=True,
         column_config=_bucket_column_config(),
     )
+    details = _bucket_detail_columns(bucket_df)
+    if not details.empty:
+        with st.expander(f"{bucket_name} bucket details", expanded=False):
+            st.dataframe(
+                details,
+                use_container_width=True,
+                hide_index=True,
+                column_config=_bucket_detail_column_config(),
+            )
 
 
 def render_bucket_chart(
@@ -1197,15 +1449,12 @@ def _bucket_table_columns(bucket_df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "Rank",
         "Ticker",
-        "Bucket",
         "Momentum Trend Score",
-        "Combined Overlay Score",
         "Label",
         "Timeframe Return",
         "RS vs Target",
         "RS vs Benchmark",
         "RS vs SPY",
-        "RS vs Theme",
         "Trend",
         "Volume",
         "Risk",
@@ -1218,15 +1467,47 @@ def _bucket_table_columns(bucket_df: pd.DataFrame) -> pd.DataFrame:
     return display
 
 
+def _bucket_detail_columns(bucket_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Ticker",
+        "Bucket",
+        "Bucket Source",
+        "Override Applied",
+        "Override Mode",
+        "Combined Overlay Score",
+        "RS vs Theme",
+        "RS vs Peer Median",
+        "RS vs Sector",
+        "RS vs Industry",
+    ]
+    existing = [column for column in columns if column in bucket_df.columns]
+    if not existing:
+        return pd.DataFrame()
+    display = bucket_df[existing].copy()
+    for column in ["RS vs Theme", "RS vs Peer Median", "RS vs Sector", "RS vs Industry"]:
+        if column in display.columns:
+            display[column] = display[column] * 100
+    return display
+
+
 def _bucket_column_config() -> dict:
     return {
         "Momentum Trend Score": st.column_config.ProgressColumn("Momentum", min_value=0, max_value=100, format="%.0f"),
-        "Combined Overlay Score": st.column_config.ProgressColumn("Overlay", min_value=0, max_value=100, format="%.0f"),
         "Timeframe Return": st.column_config.NumberColumn("Timeframe Return", format="%.1f%%"),
         "RS vs Target": st.column_config.NumberColumn("RS vs Target", format="%.1f%%"),
         "RS vs Benchmark": st.column_config.NumberColumn("RS vs QQQ", format="%.1f%%"),
         "RS vs SPY": st.column_config.NumberColumn("RS vs SPY", format="%.1f%%"),
+    }
+
+
+def _bucket_detail_column_config() -> dict:
+    return {
+        "Override Applied": st.column_config.CheckboxColumn("Override Applied"),
+        "Combined Overlay Score": st.column_config.ProgressColumn("Overlay", min_value=0, max_value=100, format="%.0f"),
         "RS vs Theme": st.column_config.NumberColumn("RS vs Theme", format="%.1f%%"),
+        "RS vs Peer Median": st.column_config.NumberColumn("RS vs Peer Median", format="%.1f%%"),
+        "RS vs Sector": st.column_config.NumberColumn("RS vs Sector", format="%.1f%%"),
+        "RS vs Industry": st.column_config.NumberColumn("RS vs Industry", format="%.1f%%"),
     }
 
 
@@ -1341,6 +1622,9 @@ def _advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "Ticker",
         "Bucket",
+        "Bucket Source",
+        "Override Applied",
+        "Override Mode",
         "Company",
         "Sector",
         "Industry",
@@ -1358,7 +1642,8 @@ def _advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Recent Drawdown",
         "Warnings",
     ]
-    display = df[columns].copy()
+    existing = [column for column in columns if column in df.columns]
+    display = df[existing].copy()
     for column in [
         "ATR %",
         "Distance 50D SMA",
@@ -1370,7 +1655,8 @@ def _advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Volume Percentile",
         "Recent Drawdown",
     ]:
-        display[column] = display[column] * 100
+        if column in display.columns:
+            display[column] = display[column] * 100
     return display
 
 
@@ -1387,6 +1673,7 @@ def _column_config() -> dict:
 
 def _advanced_column_config() -> dict:
     return {
+        "Override Applied": st.column_config.CheckboxColumn("Override Applied"),
         "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
         "Dollar Volume": st.column_config.NumberColumn("Dollar Volume", format="$%.0f"),
         "RVOL 20D": st.column_config.NumberColumn("RVOL", format="%.2f"),

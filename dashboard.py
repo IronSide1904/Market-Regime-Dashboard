@@ -23,6 +23,7 @@ from config import (
     REGIME_RULES,
     RELATIVE_CONTEXT_CONFIG,
     RELATIVE_TREND_QUALITY_CONFIG,
+    SCREENER_PEER_OVERRIDE_CONFIG,
     SENSITIVITY_LOOKBACKS,
     SWING_TIMEFRAMES,
     SWING_TIMEFRAME_TO_VOLATILITY_PRESET,
@@ -787,6 +788,83 @@ def _render_sidebar(ticker: str) -> tuple[str, str, str, str, str, str, str, str
                     st.caption(f"Relative comparison will try to use {peer_override_ticker}.")
                 else:
                     st.caption("Enter or choose a peer to activate the override.")
+        if SCREENER_PEER_OVERRIDE_CONFIG.get("enabled", True):
+            with st.expander("Peer Universe Override", expanded=False):
+                loaded_preset = st.session_state.get("screener_loaded_preset")
+                loaded_preset = loaded_preset if isinstance(loaded_preset, dict) else {}
+                if st.session_state.pop("screener_apply_loaded_preset", False):
+                    st.session_state["screener_peer_override_enabled"] = bool(
+                        loaded_preset.get(
+                            "peer_override_enabled",
+                            SCREENER_PEER_OVERRIDE_CONFIG.get("default_enabled", False),
+                        )
+                    )
+                    loaded_tickers_for_state = loaded_preset.get("peer_override_tickers", [])
+                    st.session_state["screener_peer_override_text"] = (
+                        ", ".join(loaded_tickers_for_state)
+                        if isinstance(loaded_tickers_for_state, list)
+                        else str(loaded_tickers_for_state or "")
+                    )
+                    st.session_state["screener_peer_override_mode"] = str(
+                        loaded_preset.get(
+                            "peer_override_mode",
+                            SCREENER_PEER_OVERRIDE_CONFIG.get("default_mode", "append"),
+                        )
+                    ).lower()
+                    st.session_state["screener_peer_override_apply_to"] = list(
+                        loaded_preset.get(
+                            "peer_override_apply_to",
+                            SCREENER_PEER_OVERRIDE_CONFIG.get("default_apply_to", []),
+                        )
+                    )
+                allowed_apply_to = ["Direct Peers", "Sector Peers", "Industry Peers"]
+                default_apply_to = [
+                    value for value in loaded_preset.get(
+                        "peer_override_apply_to",
+                        SCREENER_PEER_OVERRIDE_CONFIG.get("default_apply_to", allowed_apply_to),
+                    )
+                    if value in allowed_apply_to
+                ]
+                if not default_apply_to:
+                    default_apply_to = list(SCREENER_PEER_OVERRIDE_CONFIG.get("default_apply_to", allowed_apply_to))
+                allowed_modes = list(SCREENER_PEER_OVERRIDE_CONFIG.get("allowed_modes", ["append", "replace"]))
+                mode_labels = {
+                    "append": "Append to auto-detected",
+                    "replace": "Replace auto-detected",
+                }
+                loaded_mode = str(loaded_preset.get("peer_override_mode", SCREENER_PEER_OVERRIDE_CONFIG.get("default_mode", "append"))).lower()
+                if loaded_mode not in allowed_modes:
+                    loaded_mode = str(SCREENER_PEER_OVERRIDE_CONFIG.get("default_mode", "append"))
+                st.checkbox(
+                    "Enable peers override",
+                    value=bool(loaded_preset.get("peer_override_enabled", SCREENER_PEER_OVERRIDE_CONFIG.get("default_enabled", False))),
+                    key="screener_peer_override_enabled",
+                    help="Controls the Screener comparison universe before ranks, medians, bucket tables, and bucket charts are calculated.",
+                )
+                loaded_tickers = loaded_preset.get("peer_override_tickers", [])
+                loaded_text = ", ".join(loaded_tickers) if isinstance(loaded_tickers, list) else str(loaded_tickers or "")
+                st.text_area(
+                    "Override tickers",
+                    value=loaded_text,
+                    key="screener_peer_override_text",
+                    placeholder="NVDA, INTC, AVGO, MRVL, MU, ARM",
+                    help="Comma, space, or newline separated. Crypto slash formats are normalized.",
+                )
+                st.radio(
+                    "Override mode",
+                    allowed_modes,
+                    index=allowed_modes.index(loaded_mode),
+                    format_func=lambda value: mode_labels.get(value, str(value).title()),
+                    key="screener_peer_override_mode",
+                    horizontal=False,
+                )
+                st.multiselect(
+                    "Apply override to",
+                    allowed_apply_to,
+                    default=default_apply_to,
+                    key="screener_peer_override_apply_to",
+                )
+                st.caption("Applies to Screener Direct, Sector, and Industry peer buckets. Theme peers stay separate.")
         st.markdown("**Timeframe Scope**")
         st.caption("Timeframe: changes MR-1 score horizon, charts, backtests, and Volume Context when its preset is Auto.")
         st.caption("Swing timeframe: changes Swing Score horizon, focused return window, and Swing Volatility when its preset is Auto.")

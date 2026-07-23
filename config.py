@@ -654,6 +654,17 @@ SCREENER_TARGET_TICKER_CONFIG = {
     "max_auto_peers": 25,
 }
 
+SCREENER_PEER_OVERRIDE_CONFIG = {
+    "enabled": True,
+    "default_enabled": False,
+    "default_mode": "append",
+    "allowed_modes": ["append", "replace"],
+    "default_apply_to": ["Direct Peers", "Sector Peers", "Industry Peers"],
+    "always_include_target": True,
+    "always_include_benchmarks": True,
+    "max_override_tickers": 50,
+}
+
 SCREENER_PEER_MAP = {
     "AMD": {
         "theme": "AI Semiconductors",
