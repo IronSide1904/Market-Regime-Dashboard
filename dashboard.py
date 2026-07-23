@@ -121,7 +121,7 @@ def render_dashboard() -> None:
         "Screener",
         "Performance Comparison",
         "Peers / Sector / Industry / Theme",
-        "Relative Context",
+        "Relative Strength Context",
     ]
     active_tab = _render_tab_buttons(tab_labels)
     if active_tab == "Screener":
@@ -230,8 +230,8 @@ def render_dashboard() -> None:
             "relationship_status": "Unavailable",
             "score_adjustment": 0,
             "confidence": "Low",
-            "interpretation": "Relative Context is disabled.",
-            "warnings": ["Relative Context is disabled."],
+            "interpretation": "Relative Strength Context is disabled.",
+            "warnings": ["Relative Strength Context is disabled."],
             "history": pd.DataFrame(),
         }
         relative_context.update(_comparison_context_metadata(comparison_resolution, benchmark))
@@ -353,6 +353,7 @@ def render_dashboard() -> None:
             ]
         )
         _render_combined_risk_overlay_headline(combined_risk_overlay, scored=scored)
+        _render_regime_score_analysis(scored=scored, signals=signals, latest_regime=str(latest["Regime"]))
         _render_summary(
             ticker=ticker,
             benchmark=benchmark,
@@ -380,7 +381,6 @@ def render_dashboard() -> None:
         )
         _render_clean_relative_trend_card(clean_relative_trend, show_chart=True)
         render_screener_context_snapshot(target_ticker=ticker, title="Latest Screener Bucket Context")
-        _render_regime_score_analysis(scored=scored, signals=signals, latest_regime=str(latest["Regime"]))
         _render_hmm_summary(hmm_result=hmm_result, rule_regime=str(latest["Regime"]))
         _render_regime_guide(str(latest["Regime"]))
         _render_scope_badges([("Reading", "Latest timeframe-aware score"), ("Sensitivity", sensitivity)])
@@ -505,7 +505,7 @@ def render_dashboard() -> None:
             comparison_type=comparison_resolution["comparison_type"],
         )
 
-    elif active_tab == "Relative Context":
+    elif active_tab == "Relative Strength Context":
         _render_scope_badges(
             [
                 ("Layer", "Small MR-1 modifier"),
@@ -513,6 +513,10 @@ def render_dashboard() -> None:
                 ("Comparison", f"{comparison_ticker} ({comparison_resolution['comparison_type']})"),
                 ("Score Impact", _format_signed_points(int(relative_context.get("score_adjustment", 0)))),
             ]
+        )
+        st.caption(
+            "Analyzes ticker leadership versus the selected comparison: relative performance, "
+            "relationship stability, stretch, beta sensitivity, and volume confirmation."
         )
         _render_relative_context_detail(relative_context=relative_context)
 
@@ -750,7 +754,7 @@ def _render_sidebar(ticker: str) -> tuple[str, str, str, str, str, str, str, str
                     mode_options,
                     index=mode_options.index(st.session_state["peer_override_mode"]),
                     key="peer_override_mode",
-                    help="Auto and Disabled use the benchmark. Suggested/Custom use that ticker for Relative Context and Clean Relative Trend.",
+                    help="Auto and Disabled use the benchmark. Suggested/Custom use that ticker for Relative Strength Context and Clean Relative Trend.",
                 )
 
                 if suggested_peers:
@@ -784,7 +788,7 @@ def _render_sidebar(ticker: str) -> tuple[str, str, str, str, str, str, str, str
                     peer_override_ticker = None
 
                 if peer_override_mode in {"Auto", "Disabled"}:
-                    st.caption("Relative Context and Clean Relative Trend use the active benchmark.")
+                    st.caption("Relative Strength Context and Clean Relative Trend use the active benchmark.")
                 elif peer_override_ticker:
                     st.caption(f"Relative comparison will try to use {peer_override_ticker}.")
                 else:
@@ -1063,6 +1067,8 @@ def _render_scope_badges(items: list[tuple[str, str]]) -> None:
 def _render_tab_buttons(labels: list[str]) -> str:
     if "dashboard_tab_selector" not in st.session_state:
         st.session_state["dashboard_tab_selector"] = labels[0]
+    if st.session_state.get("dashboard_tab_selector") == "Relative Context":
+        st.session_state["dashboard_tab_selector"] = "Relative Strength Context"
 
     return st.radio(
         "Dashboard section",
@@ -1307,6 +1313,12 @@ def _render_volume_context_card(
         """,
         unsafe_allow_html=True,
     )
+    _render_turnover_analysis(
+        ticker=ticker,
+        latest=latest,
+        ticker_metadata=ticker_metadata,
+        volume_table=volume_table,
+    )
     if not volume_table.empty:
         st.markdown("**Ticker vs Peers / Sector Volume**")
         st.dataframe(
@@ -1320,6 +1332,65 @@ def _render_volume_context_card(
             width="stretch",
             key=f"overview_avg_float_turnover_{ticker}",
         )
+
+
+def _render_turnover_analysis(
+    ticker: str,
+    latest: pd.Series,
+    ticker_metadata: dict,
+    volume_table: pd.DataFrame,
+) -> None:
+    st.subheader("Turnover Analysis")
+    st.caption(
+        "Turnover measures how much of the tradable float is changing hands. Use it to confirm "
+        "whether a move has real participation behind it, especially versus the ticker's own norm and peer group."
+    )
+
+    current_turnover = _optional_float(latest.get("Daily Float Turnover"))
+    average_turnover = _metadata_average_float_turnover(ticker_metadata)
+    peer_median_turnover = None
+
+    if not volume_table.empty:
+        ticker_rows = volume_table.loc[volume_table["Ticker"].astype(str).str.upper() == ticker.upper()]
+        if not ticker_rows.empty:
+            ticker_row = ticker_rows.iloc[0]
+            current_turnover = _optional_float(ticker_row.get("Current Float Turnover")) or current_turnover
+            average_turnover = _optional_float(ticker_row.get("Avg Daily Float Turnover")) or average_turnover
+
+        peer_turnover = pd.to_numeric(
+            volume_table.loc[volume_table["Type"] == "Peer", "Avg Daily Float Turnover"],
+            errors="coerce",
+        ).dropna()
+        if not peer_turnover.empty:
+            peer_median_turnover = float(peer_turnover.median())
+
+    own_gap = _relative_gap(current_turnover, average_turnover)
+    peer_gap = _relative_gap(average_turnover, peer_median_turnover)
+
+    def delta_text(value: float | None) -> str | None:
+        return None if value is None else f"{value:+.1%}"
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Current Float Turnover", _format_optional_pct(current_turnover), delta=delta_text(own_gap))
+    col2.metric("Avg Daily Float Turnover", _format_optional_pct(average_turnover), delta=delta_text(peer_gap))
+    col3.metric("Peer Median Avg Turnover", _format_optional_pct(peer_median_turnover))
+    col4.metric("Finviz Float", _format_optional_number(ticker_metadata.get("shares_float")))
+
+    if current_turnover is None:
+        st.info("Float turnover needs shares-float metadata. If Finviz cannot provide float for this ticker, turnover is unavailable.")
+        return
+
+    if own_gap is not None and own_gap >= 0.5:
+        read = "Current turnover is materially above the ticker's normal average, which confirms unusual participation."
+    elif own_gap is not None and own_gap <= -0.35:
+        read = "Current turnover is below the ticker's normal average, so the latest move has weaker participation."
+    else:
+        read = "Current turnover is near the ticker's normal average, so participation is present but not unusually strong."
+
+    if peer_gap is not None:
+        peer_read = "above" if peer_gap > 0 else "below"
+        read += f" Its average turnover is {abs(peer_gap):.0%} {peer_read} the peer median."
+    st.info(read)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2320,7 +2391,7 @@ def _render_relative_context_card(
     adjusted_regime: str,
     adjusted_exposure: float,
 ) -> None:
-    st.subheader("Relative Context")
+    st.subheader("Relative Strength Context")
     comparison_ticker = relative_context.get("comparison_ticker") or relative_context.get("benchmark", "N/A")
     comparison_type = relative_context.get("comparison_type", "Benchmark")
     st.caption(
@@ -2345,7 +2416,7 @@ def _render_relative_context_card(
         f"Relative-adjusted read: {adjusted_score}/100, {adjusted_regime}, "
         f"{_format_pct(adjusted_exposure)} exposure. Base MR-1 remains {base_score}/100."
     )
-    st.info(f"{relative_context.get('interpretation', 'Relative context unavailable.')} {adjusted_text}")
+    st.info(f"{relative_context.get('interpretation', 'Relative strength context unavailable.')} {adjusted_text}")
     for warning in relative_context.get("warnings", [])[:2]:
         st.warning(warning)
 
@@ -2513,15 +2584,19 @@ def _overall_recommendation_conclusion(
 
 
 def _render_relative_context_detail(relative_context: dict) -> None:
-    st.subheader("Relative Context")
+    st.subheader("Relative Strength Context")
+    st.caption(
+        "This tab is a confirmation and timing layer. It compares the ticker with the active benchmark, "
+        "peer, sector, or override to show whether leadership is improving, stable, extended, or weakening."
+    )
     if not relative_context.get("available"):
-        st.info(relative_context.get("interpretation", "Relative context unavailable."))
+        st.info(relative_context.get("interpretation", "Relative strength context unavailable."))
         _render_relative_context_explainer(relative_context)
         for warning in relative_context.get("warnings", []):
             st.warning(warning)
         return
 
-    st.info(relative_context.get("interpretation", "Relative context unavailable."))
+    st.info(relative_context.get("interpretation", "Relative strength context unavailable."))
     _render_relative_context_explainer(relative_context)
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Status", relative_context.get("relationship_status", "Unavailable"))
@@ -2612,7 +2687,7 @@ def _render_relative_context_detail(relative_context: dict) -> None:
             st.warning(warning)
 
     if DEBUG_MODE:
-        st.markdown("**Relative Context Debug**")
+        st.markdown("**Relative Strength Context Debug**")
         st.json(relative_context.get("debug", {}))
 
 
@@ -2636,7 +2711,7 @@ def _render_relative_context_explainer(relative_context: dict) -> None:
     comparison_type = str(relative_context.get("comparison_type") or "Benchmark")
     st.markdown("**How to read this tab**")
     st.caption(
-        f"Relative Context asks whether {ticker} is acting better or worse than {benchmark} ({comparison_type}). "
+        f"Relative Strength Context asks whether {ticker} is acting better or worse than {benchmark} ({comparison_type}). "
         "Use it as confirmation and timing context, not as a standalone buy/sell signal."
     )
     guide = pd.DataFrame(
@@ -2649,7 +2724,7 @@ def _render_relative_context_explainer(relative_context: dict) -> None:
             (
                 "Score Impact",
                 "A small modifier applied to the MR-1 read, capped between -10 and +10 points.",
-                "Positive impact means relative context helps. Negative impact means caution. The original MR-1 score still remains the base.",
+                "Positive impact means relative strength context helps. Negative impact means caution. The original MR-1 score still remains the base.",
             ),
             (
                 "5D / 20D / 60D Relative",
@@ -4237,22 +4312,56 @@ def _regime_duration_timeline_chart(regime_persistence: RegimePersistenceResult)
     timeline = regime_persistence.timeline
     colors = {"Risk-On": "#22c55e", "Neutral": "#f59e0b", "Defensive": "#ef4444"}
     if timeline.empty:
-        return _finish_chart(fig, title="Regime Duration Timeline")
+        return _finish_chart(fig, title="Regime Duration by Episode")
 
-    for _, row in timeline.iterrows():
-        regime = row["Regime"]
+    timeline = timeline.copy()
+    timeline["Start"] = pd.to_datetime(timeline["Start"])
+    timeline["End"] = pd.to_datetime(timeline["End"])
+    timeline["Days"] = pd.to_numeric(timeline["Days"], errors="coerce")
+    timeline = timeline.dropna(subset=["End", "Days"]).sort_values("End")
+    if timeline.empty:
+        return _finish_chart(fig, title="Regime Duration by Episode")
+
+    fig.add_trace(
+        go.Scatter(
+            x=timeline["End"],
+            y=timeline["Days"],
+            mode="lines",
+            line=dict(color="#64748b", width=2),
+            name="Episode duration",
+            hoverinfo="skip",
+        )
+    )
+    for regime in ["Risk-On", "Neutral", "Defensive"]:
+        regime_points = timeline[timeline["Regime"] == regime]
+        if regime_points.empty:
+            continue
+        customdata = [
+            [
+                row["Start"].strftime("%Y-%m-%d"),
+                row["End"].strftime("%Y-%m-%d"),
+                int(row["Days"]),
+            ]
+            for _, row in regime_points.iterrows()
+        ]
         fig.add_trace(
             go.Scatter(
-                x=[row["Start"], row["End"]],
-                y=[regime, regime],
-                mode="lines",
-                line=dict(color=colors.get(regime, "#94a3b8"), width=14),
+                x=regime_points["End"],
+                y=regime_points["Days"],
+                mode="markers",
+                marker=dict(color=colors.get(regime, "#94a3b8"), size=10, line=dict(color="#0f172a", width=1)),
                 name=regime,
-                showlegend=False,
-                hovertemplate=f"{regime}<br>%{{x|%Y-%m-%d}}<extra></extra>",
+                customdata=customdata,
+                hovertemplate=(
+                    f"{regime}<br>"
+                    "Start: %{customdata[0]}<br>"
+                    "End: %{customdata[1]}<br>"
+                    "Duration: %{customdata[2]} trading days<extra></extra>"
+                ),
             )
         )
-    return _finish_chart(fig, title="Regime Duration Timeline")
+    fig.update_yaxes(title_text="Trading days in regime")
+    return _finish_chart(fig, title="Regime Duration by Episode")
 
 
 def _score_chart(scored: pd.DataFrame) -> go.Figure:
