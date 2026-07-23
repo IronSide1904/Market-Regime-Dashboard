@@ -1690,6 +1690,8 @@ def _advanced_column_config() -> dict:
 
 
 def _clean_ohlcv(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty or "Close" not in frame.columns:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
     columns = [column for column in ["Open", "High", "Low", "Close", "Volume"] if column in frame.columns]
     return frame[columns].apply(pd.to_numeric, errors="coerce").dropna(subset=["Close"])
 
