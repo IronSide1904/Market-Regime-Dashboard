@@ -735,7 +735,7 @@ def _render_sidebar(ticker: str) -> tuple[str, str, str, str, str, str, str, str
         peer_override_mode = PEER_OVERRIDE_CONFIG.get("default_mode", "Auto")
         peer_override_ticker = None
         if PEER_OVERRIDE_CONFIG.get("enabled", True):
-            with st.expander("Peer Override", expanded=False):
+            with st.expander("Relative Peer Override", expanded=False):
                 normalized_ticker = normalize_ticker(ticker)
                 suggested_peers = PEER_GROUPS.get(normalized_ticker, [])
                 mode_options = ["Auto", "Suggested Peer", "Custom Ticker", "Disabled"]
@@ -789,7 +789,7 @@ def _render_sidebar(ticker: str) -> tuple[str, str, str, str, str, str, str, str
                 else:
                     st.caption("Enter or choose a peer to activate the override.")
         if SCREENER_PEER_OVERRIDE_CONFIG.get("enabled", True):
-            with st.expander("Peer Universe Override", expanded=False):
+            with st.expander("Screener Peer Universe Override", expanded=False):
                 loaded_preset = st.session_state.get("screener_loaded_preset")
                 loaded_preset = loaded_preset if isinstance(loaded_preset, dict) else {}
                 if st.session_state.pop("screener_apply_loaded_preset", False):
@@ -864,7 +864,7 @@ def _render_sidebar(ticker: str) -> tuple[str, str, str, str, str, str, str, str
                     default=default_apply_to,
                     key="screener_peer_override_apply_to",
                 )
-                st.caption("Applies to Screener Direct, Sector, and Industry peer buckets. Theme peers stay separate.")
+                st.caption("Applies only to the Screener universe: Direct, Sector, and Industry peer buckets. Theme peers stay separate.")
         st.markdown("**Timeframe Scope**")
         st.caption("Timeframe: changes MR-1 score horizon, charts, backtests, and Volume Context when its preset is Auto.")
         st.caption("Swing timeframe: changes Swing Score horizon, focused return window, and Swing Volatility when its preset is Auto.")

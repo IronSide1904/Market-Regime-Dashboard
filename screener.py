@@ -575,7 +575,20 @@ def render_screener_tab() -> None:
         st.info("Choose a universe or paste tickers to run the screener.")
         return
 
+    last_run = st.session_state.get("screener_last_run")
     if not controls["run"]:
+        if isinstance(last_run, dict) and not last_run.get("sorted_df", pd.DataFrame()).empty:
+            st.caption("Showing the last Screener run. Click **Run Screener** to apply any changed form controls.")
+            _render_screener_results(
+                scored=last_run.get("scored", pd.DataFrame()),
+                filtered=last_run.get("filtered", pd.DataFrame()),
+                sorted_df=last_run.get("sorted_df", pd.DataFrame()),
+                ticker_data=last_run.get("ticker_data", {}),
+                skipped=last_run.get("skipped", []),
+                controls=last_run.get("controls", controls),
+            )
+            return
+
         st.info("Set the controls, then click **Run Screener**.")
         if SCREENER_BUCKET_ANALYSIS_CONFIG.get("enabled", True):
             st.subheader("Bucket Analysis")
@@ -618,6 +631,34 @@ def render_screener_tab() -> None:
         timeframe=controls["timeframe"],
     )
     scored = calculate_momentum_trend_score(features)
+    filtered = _apply_screener_filters(scored, controls)
+    sorted_df = _sort_screener(filtered, controls["sort_by"]).head(int(controls["top_n"]))
+    st.session_state["screener_last_run"] = {
+        "scored": scored,
+        "filtered": filtered,
+        "sorted_df": sorted_df,
+        "ticker_data": ticker_data,
+        "skipped": skipped,
+        "controls": controls,
+    }
+    _render_screener_results(
+        scored=scored,
+        filtered=filtered,
+        sorted_df=sorted_df,
+        ticker_data=ticker_data,
+        skipped=skipped,
+        controls=controls,
+    )
+
+
+def _render_screener_results(
+    scored: pd.DataFrame,
+    filtered: pd.DataFrame,
+    sorted_df: pd.DataFrame,
+    ticker_data: dict[str, pd.DataFrame],
+    skipped: list[str],
+    controls: dict,
+) -> None:
     if controls.get("mode") == "Ticker Comparison":
         _render_target_relative_summary(
             target_ticker=controls["target_ticker"],
@@ -626,8 +667,6 @@ def render_screener_tab() -> None:
             market_benchmark=controls["market_benchmark"],
             theme_name=controls.get("detected_theme"),
         )
-    filtered = _apply_screener_filters(scored, controls)
-    sorted_df = _sort_screener(filtered, controls["sort_by"]).head(int(controls["top_n"]))
 
     col_a, col_b, col_c = st.columns(3)
     col_a.metric("Screened", f"{len(scored)}")
