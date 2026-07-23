@@ -713,7 +713,7 @@ SCREENER_BUCKET_CHART_OPTIONS = [
     "RS vs SPY",
     "RS vs Theme",
     "Timeframe Return",
-    "ATR % Price",
+    "ATR % / Risk",
 ]
 
 LEVERAGED_TICKER_MAP = {

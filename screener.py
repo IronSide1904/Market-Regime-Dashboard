@@ -898,15 +898,21 @@ def group_screener_results_by_bucket(results_df: pd.DataFrame) -> dict[str, pd.D
         "Manual Override",
         "Universe",
     ]
-    grouped: dict[str, pd.DataFrame] = {}
+    grouped_frames: dict[str, list[pd.DataFrame]] = {}
     for bucket in bucket_order:
         mask = results_df["Bucket"].astype(str).str.split(" / ").apply(lambda labels: bucket in labels)
         bucket_df = results_df.loc[mask].copy()
         if not bucket_df.empty:
-            grouped[_bucket_display_name(bucket)] = bucket_df.sort_values(
-                ["Momentum Trend Score", "Timeframe Return"], ascending=False
-            ).reset_index(drop=True)
+            grouped_frames.setdefault(_bucket_display_name(bucket), []).append(bucket_df)
 
+    grouped: dict[str, pd.DataFrame] = {}
+    for bucket_name, frames in grouped_frames.items():
+        grouped[bucket_name] = (
+            pd.concat(frames, ignore_index=True)
+            .drop_duplicates(subset=["Ticker"])
+            .sort_values(["Momentum Trend Score", "Timeframe Return"], ascending=False)
+            .reset_index(drop=True)
+        )
     return grouped
 
 
@@ -923,7 +929,13 @@ def render_bucket_table(bucket_name: str, bucket_df: pd.DataFrame) -> None:
     )
 
 
-def render_bucket_chart(bucket_name: str, bucket_df: pd.DataFrame, chart_type: str, target_ticker: str | None = None) -> None:
+def render_bucket_chart(
+    bucket_name: str,
+    bucket_df: pd.DataFrame,
+    chart_type: str,
+    target_ticker: str | None = None,
+    target_row: pd.Series | None = None,
+) -> None:
     if bucket_df.empty:
         st.info(f"No chart data for {bucket_name}.")
         return
@@ -937,6 +949,7 @@ def render_bucket_chart(bucket_name: str, bucket_df: pd.DataFrame, chart_type: s
         "RS vs SPY": "RS vs SPY",
         "RS vs Theme": "RS vs Theme",
         "Timeframe Return": "Timeframe Return",
+        "ATR % / Risk": "ATR %",
         "ATR % Price": "ATR %",
     }
     column = chart_map.get(chart_type)
@@ -954,7 +967,7 @@ def render_bucket_chart(bucket_name: str, bucket_df: pd.DataFrame, chart_type: s
         st.info("Float turnover unavailable for this bucket.")
         return
 
-    percent_chart = chart_type in {"RS vs Target", "RS vs QQQ", "RS vs SPY", "RS vs Theme", "Timeframe Return", "ATR % Price"}
+    percent_chart = chart_type in {"RS vs Target", "RS vs QQQ", "RS vs SPY", "RS vs Theme", "Timeframe Return", "ATR % / Risk", "ATR % Price"}
     y_values = chart_df[column] * 100 if percent_chart else chart_df[column]
     colors = [
         "#22d3ee" if target_ticker and normalize_ticker(ticker) == normalize_ticker(target_ticker) else "#60a5fa"
@@ -974,6 +987,15 @@ def render_bucket_chart(bucket_name: str, bucket_df: pd.DataFrame, chart_type: s
     if chart_type in {"Combined Overlay Score", "Momentum Trend Score"}:
         fig.add_hline(y=80 if chart_type == "Combined Overlay Score" else 65, line_dash="dash", line_color="#22c55e")
         fig.add_hline(y=50, line_dash="dash", line_color="#f59e0b")
+    if target_row is not None and column in target_row.index and target_ticker:
+        target_value = _number(target_row.get(column))
+        if target_value is not None:
+            fig.add_hline(
+                y=target_value * 100 if percent_chart else target_value,
+                line_dash="dot",
+                line_color="#22d3ee",
+                annotation_text=f"{normalize_ticker(target_ticker)} reference",
+            )
     fig.update_layout(
         title=f"{bucket_name} - {chart_type}",
         height=430,
@@ -1097,6 +1119,7 @@ def render_bucket_analysis_section(
                 continue
 
             bucket_df = grouped[bucket_name]
+            target_row = _target_row(results_df, target_ticker)
             _render_bucket_summary(bucket_name=bucket_name, bucket_df=bucket_df, target_ticker=target_ticker)
             if SCREENER_BUCKET_ANALYSIS_CONFIG.get("show_bucket_tables", True):
                 render_bucket_table(bucket_name=bucket_name, bucket_df=bucket_df)
@@ -1108,7 +1131,13 @@ def render_bucket_analysis_section(
                     index=SCREENER_BUCKET_CHART_OPTIONS.index(default_chart) if default_chart in SCREENER_BUCKET_CHART_OPTIONS else 0,
                     key=f"bucket_chart_type_{bucket_name}",
                 )
-                render_bucket_chart(bucket_name=bucket_name, bucket_df=bucket_df, chart_type=chart_type, target_ticker=target_ticker)
+                render_bucket_chart(
+                    bucket_name=bucket_name,
+                    bucket_df=bucket_df,
+                    chart_type=chart_type,
+                    target_ticker=target_ticker,
+                    target_row=target_row,
+                )
 
 
 def _render_bucket_summary(bucket_name: str, bucket_df: pd.DataFrame, target_ticker: str | None = None) -> None:
@@ -1138,8 +1167,16 @@ def _bucket_display_name(bucket: str) -> str:
     if bucket == "Industry Peer":
         return "Industry Peers"
     if bucket in {"Benchmark", "Market Benchmark"}:
-        return "Benchmarks" if bucket == "Benchmark" else "Market Benchmarks"
+        return "Benchmarks"
     return bucket
+
+
+def _target_row(results_df: pd.DataFrame, target_ticker: str | None) -> pd.Series | None:
+    target = normalize_ticker(target_ticker or "")
+    if not target or results_df.empty or "Ticker" not in results_df.columns:
+        return None
+    rows = results_df.loc[results_df["Ticker"] == target]
+    return rows.iloc[0] if not rows.empty else None
 
 
 def _bucket_table_columns(bucket_df: pd.DataFrame) -> pd.DataFrame:
