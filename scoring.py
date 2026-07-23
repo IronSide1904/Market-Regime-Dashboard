@@ -50,6 +50,7 @@ def score_history(
     ticker_ohlcv: pd.DataFrame | None = None,
     shares_float: float | None = None,
     volume_timeframe_config: dict | None = None,
+    share_count_info: dict | None = None,
 ) -> pd.DataFrame:
     scored = indicators.copy()
     weights = SEARCHABLE_SIGNAL_WEIGHTS
@@ -96,6 +97,7 @@ def score_history(
         ticker_ohlcv=ticker_ohlcv,
         shares_float=shares_float,
         volume_timeframe_config=volume_timeframe_config,
+        share_count_info=share_count_info,
     )
     if volume_history.empty:
         scored["Volume Context"] = "Unavailable"
@@ -116,6 +118,15 @@ def score_history(
         scored["Dollar Volume"] = np.nan
         scored["Daily Float Turnover"] = np.nan
         scored["5D Float Turnover"] = np.nan
+        scored["Turnover Available"] = False
+        scored["Turnover Label"] = "Turnover unavailable"
+        scored["Turnover Type"] = None
+        scored["Turnover Source"] = None
+        scored["Turnover Denominator"] = np.nan
+        scored["Daily Turnover"] = np.nan
+        scored["Avg Daily Turnover"] = np.nan
+        scored["5D Turnover"] = np.nan
+        scored["Turnover Warning"] = "No share-count denominator available."
         scored["Volume Explanation"] = "Volume context is unavailable because usable ticker volume data was not found."
     else:
         scored = scored.join(volume_history.reindex(scored.index))
@@ -140,6 +151,7 @@ def _volume_history(
     ticker_ohlcv: pd.DataFrame | None,
     shares_float: float | None,
     volume_timeframe_config: dict | None,
+    share_count_info: dict | None,
 ) -> pd.DataFrame:
     if ticker_ohlcv is None or ticker_ohlcv.empty:
         return pd.DataFrame()
@@ -159,6 +171,7 @@ def _volume_history(
         vix_status=vix_status,
         shares_float=shares_float,
         timeframe_config=volume_timeframe_config,
+        share_count_info=share_count_info,
     )
 
 

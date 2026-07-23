@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from config import CUSTOM_TIMEFRAME_LIMITS, DEFAULT_TIMEFRAME_PRESET, TIMEFRAME_PRESETS, VOLUME_CONFIG
+from config import CUSTOM_TIMEFRAME_LIMITS, DEFAULT_TIMEFRAME_PRESET, MANUAL_FLOAT_SHARES, TIMEFRAME_PRESETS, VOLUME_CONFIG
 
 
 UNAVAILABLE_CONTEXT = {
@@ -27,8 +27,165 @@ UNAVAILABLE_CONTEXT = {
     "daily_float_turnover": np.nan,
     "five_day_float_turnover": np.nan,
     "float_turnovers": {},
+    "turnover_available": False,
+    "turnover_label": "Turnover unavailable",
+    "turnover_type": None,
+    "turnover_source": None,
+    "turnover_denominator": np.nan,
+    "avg_daily_turnover": np.nan,
+    "five_day_turnover": np.nan,
+    "turnover_warning": "No share-count denominator available.",
     "explanation": "Volume context is unavailable because usable ticker volume data was not found.",
 }
+
+
+def resolve_share_count_for_turnover(
+    ticker: str,
+    finviz_metadata: dict | None = None,
+    yfinance_metadata: dict | None = None,
+    manual_float_map: dict | None = None,
+    latest_price: float | None = None,
+) -> dict:
+    """
+    Resolve the best available denominator for turnover calculations.
+
+    Priority:
+    1. Finviz shares_float
+    2. yfinance floatShares
+    3. manual config shares_float
+    4. yfinance sharesOutstanding
+    5. marketCap / latest_price estimate
+    """
+    ticker = str(ticker or "").upper()
+    finviz_metadata = finviz_metadata or {}
+    yfinance_metadata = yfinance_metadata or finviz_metadata
+    manual_float_map = manual_float_map or MANUAL_FLOAT_SHARES
+
+    finviz_float = _number_or_none(finviz_metadata.get("finviz_shares_float"))
+    if finviz_float is None and str(finviz_metadata.get("source", "")).lower() == "finviz":
+        source_hint = str(finviz_metadata.get("shares_float_source") or "finviz").lower()
+        if source_hint == "finviz":
+            finviz_float = _number_or_none(finviz_metadata.get("shares_float"))
+    if finviz_float:
+        return _share_count_result(
+            available=True,
+            count=finviz_float,
+            count_type="shares_float",
+            source="finviz",
+            is_true_float=True,
+        )
+
+    yfinance_float = _number_or_none(
+        yfinance_metadata.get("yfinance_float_shares")
+        or yfinance_metadata.get("floatShares")
+        or (
+            yfinance_metadata.get("shares_float")
+            if str(yfinance_metadata.get("shares_float_source", "")).lower() == "yfinance_floatshares"
+            else None
+        )
+    )
+    if yfinance_float:
+        return _share_count_result(
+            available=True,
+            count=yfinance_float,
+            count_type="floatShares",
+            source="yfinance",
+            is_true_float=True,
+        )
+
+    manual_float = _number_or_none(manual_float_map.get(ticker))
+    if manual_float:
+        return _share_count_result(
+            available=True,
+            count=manual_float,
+            count_type="shares_float",
+            source="manual_config",
+            is_true_float=True,
+        )
+
+    shares_outstanding = _number_or_none(
+        yfinance_metadata.get("yfinance_shares_outstanding")
+        or yfinance_metadata.get("sharesOutstanding")
+        or yfinance_metadata.get("shares_outstanding")
+        or finviz_metadata.get("shares_outstanding")
+    )
+    if shares_outstanding:
+        return _share_count_result(
+            available=True,
+            count=shares_outstanding,
+            count_type="sharesOutstanding",
+            source="yfinance",
+            is_true_float=False,
+            warning="Using shares outstanding proxy because shares float is unavailable.",
+        )
+
+    market_cap = _number_or_none(
+        yfinance_metadata.get("yfinance_market_cap")
+        or yfinance_metadata.get("marketCap")
+        or yfinance_metadata.get("market_cap")
+        or finviz_metadata.get("market_cap")
+    )
+    price = _number_or_none(latest_price or yfinance_metadata.get("yfinance_price") or yfinance_metadata.get("price") or finviz_metadata.get("price"))
+    if market_cap and price:
+        estimated = market_cap / price
+        if estimated:
+            return _share_count_result(
+                available=True,
+                count=estimated,
+                count_type="estimated_shares_outstanding",
+                source="estimated",
+                is_true_float=False,
+                warning="Share turnover proxy estimated from market cap / price. Use as directional only.",
+            )
+
+    return _share_count_result(
+        available=False,
+        count=None,
+        count_type=None,
+        source=None,
+        is_true_float=False,
+        warning="No share-count denominator available.",
+    )
+
+
+def calculate_turnover_metrics(
+    df: pd.DataFrame,
+    share_count_info: dict,
+    volume_window: int = 20,
+    five_day_window: int = 5,
+) -> dict:
+    """Calculate turnover metrics using the resolved share-count denominator."""
+    share_count_info = share_count_info or {}
+    denominator = _number_or_none(share_count_info.get("share_count"))
+    if df is None or df.empty or "Volume" not in df.columns or not denominator:
+        return {
+            "turnover_available": False,
+            "turnover_label": "Turnover unavailable",
+            "turnover_type": None,
+            "denominator": None,
+            "denominator_source": None,
+            "daily_turnover": None,
+            "avg_daily_turnover": None,
+            "five_day_turnover": None,
+            "warning": share_count_info.get("warning") or "No share-count denominator available.",
+        }
+
+    volume = pd.to_numeric(df["Volume"], errors="coerce")
+    daily_turnover = _latest_number(volume / denominator)
+    avg_daily_turnover = _latest_number(volume.rolling(volume_window, min_periods=max(1, min(volume_window, len(volume)))).mean() / denominator)
+    five_day_turnover = _latest_number(volume.rolling(five_day_window, min_periods=max(1, min(five_day_window, len(volume)))).sum() / denominator)
+    is_true_float = bool(share_count_info.get("is_true_float"))
+    return {
+        "turnover_available": daily_turnover is not None,
+        "turnover_label": "Float Turnover" if is_true_float else "Share Turnover Proxy",
+        "turnover_type": "true_float" if is_true_float else "shares_outstanding_proxy",
+        "denominator": denominator,
+        "denominator_source": share_count_info.get("share_count_source"),
+        "daily_turnover": daily_turnover,
+        "avg_daily_turnover": avg_daily_turnover,
+        "five_day_turnover": five_day_turnover,
+        "warning": share_count_info.get("warning"),
+    }
 
 
 def get_timeframe_config(selected_preset: str | None = None, custom_config: dict | None = None) -> dict:
@@ -58,6 +215,7 @@ def calculate_volume_metrics(
     price_df: pd.DataFrame,
     shares_float: float | None = None,
     timeframe_config: dict | None = None,
+    share_count_info: dict | None = None,
 ) -> pd.DataFrame:
     timeframe_config = timeframe_config or get_timeframe_config()
     data = price_df.copy()
@@ -92,17 +250,45 @@ def calculate_volume_metrics(
     data["Volume Z-Score"] = (data["Volume"] - volume_mean) / volume_std
     data["Dollar Volume"] = data["Close"] * data["Volume"] if "Close" in data.columns else np.nan
 
-    if shares_float:
-        data["Daily Float Turnover"] = data["Volume"] / shares_float
+    if share_count_info is None and shares_float:
+        share_count_info = _share_count_result(
+            available=True,
+            count=shares_float,
+            count_type="shares_float",
+            source="legacy",
+            is_true_float=True,
+        )
+    denominator = _number_or_none((share_count_info or {}).get("share_count"))
+    turnover_label = (share_count_info or {}).get("turnover_label") or ("Float Turnover" if (share_count_info or {}).get("is_true_float") else "Share Turnover Proxy")
+    turnover_type = "true_float" if (share_count_info or {}).get("is_true_float") else "shares_outstanding_proxy" if denominator else None
+    denominator_source = (share_count_info or {}).get("share_count_source")
+    turnover_warning = (share_count_info or {}).get("warning")
+
+    if denominator:
+        data["Daily Turnover"] = data["Volume"] / denominator
+        data["Avg Daily Turnover"] = data["Avg Volume Medium"] / denominator
+        data["5D Turnover"] = data["Volume"].rolling(5, min_periods=max(1, min(5, len(data)))).sum() / denominator
         for window in timeframe_config.get("float_turnover_windows", []):
-            data[f"{window}D Float Turnover"] = data["Volume"].rolling(window, min_periods=max(1, min(window, len(data)))).sum() / shares_float
-        first_rollup = next((window for window in timeframe_config.get("float_turnover_windows", []) if window != 1), None)
-        data["5D Float Turnover"] = data.get(f"{first_rollup}D Float Turnover", np.nan) if first_rollup else np.nan
+            data[f"{window}D Turnover"] = data["Volume"].rolling(window, min_periods=max(1, min(window, len(data)))).sum() / denominator
+        data["Daily Float Turnover"] = data["Daily Turnover"] if turnover_type == "true_float" else np.nan
+        for window in timeframe_config.get("float_turnover_windows", []):
+            data[f"{window}D Float Turnover"] = data[f"{window}D Turnover"] if turnover_type == "true_float" else np.nan
+        data["5D Float Turnover"] = data["5D Turnover"] if turnover_type == "true_float" else np.nan
     else:
+        data["Daily Turnover"] = np.nan
+        data["Avg Daily Turnover"] = np.nan
+        data["5D Turnover"] = np.nan
         data["Daily Float Turnover"] = np.nan
         data["5D Float Turnover"] = np.nan
         for window in timeframe_config.get("float_turnover_windows", []):
+            data[f"{window}D Turnover"] = np.nan
             data[f"{window}D Float Turnover"] = np.nan
+    data["Turnover Available"] = bool(denominator)
+    data["Turnover Label"] = turnover_label if denominator else "Turnover unavailable"
+    data["Turnover Type"] = turnover_type
+    data["Turnover Source"] = denominator_source
+    data["Turnover Denominator"] = denominator if denominator else np.nan
+    data["Turnover Warning"] = turnover_warning
 
     return data
 
@@ -114,6 +300,7 @@ def classify_volume_context(
     shares_float: float | None = None,
     config: dict | None = None,
     timeframe_config: dict | None = None,
+    share_count_info: dict | None = None,
 ) -> dict:
     settings = config or VOLUME_CONFIG
     timeframe_config = timeframe_config or get_timeframe_config()
@@ -123,7 +310,7 @@ def classify_volume_context(
         result["warnings"] = validation_warnings
         return result
 
-    metrics = calculate_volume_metrics(price_df, shares_float=shares_float, timeframe_config=timeframe_config)
+    metrics = calculate_volume_metrics(price_df, shares_float=shares_float, timeframe_config=timeframe_config, share_count_info=share_count_info)
     if metrics.empty:
         result = UNAVAILABLE_CONTEXT.copy()
         result["warnings"] = ["Volume metrics could not be calculated."]
@@ -152,7 +339,14 @@ def calculate_volume_context(
 ) -> dict:
     metadata = metadata or {}
     timeframe_config = timeframe_config or get_timeframe_config()
-    shares_float = metadata.get("shares_float")
+    latest_price = _latest_metric(ohlcv, "Close") if ohlcv is not None and not ohlcv.empty else metadata.get("price")
+    share_count_info = resolve_share_count_for_turnover(
+        ticker=str(metadata.get("ticker") or ""),
+        finviz_metadata=metadata,
+        yfinance_metadata=metadata,
+        latest_price=latest_price,
+    )
+    shares_float = share_count_info.get("share_count") if share_count_info.get("is_true_float") else None
     validation_warnings = validate_volume_data(ohlcv)
     warnings = list(validation_warnings)
     if ohlcv is None or ohlcv.empty or "Volume" not in ohlcv.columns:
@@ -178,15 +372,18 @@ def calculate_volume_context(
         vix_status=True,
         shares_float=shares_float,
         timeframe_config=timeframe_config,
+        share_count_info=share_count_info,
     )
+    metrics_for_summary = calculate_volume_metrics(price_df, shares_float, timeframe_config, share_count_info=share_count_info)
     result.update(
         {
             "available": result.get("context") != "Unavailable",
             "current_volume": _latest_metric(ohlcv, "Volume"),
-            "avg_volume_short": _latest_metric(calculate_volume_metrics(price_df, shares_float, timeframe_config), "Avg Volume Short"),
-            "avg_volume_medium": _latest_metric(calculate_volume_metrics(price_df, shares_float, timeframe_config), "Avg Volume Medium"),
-            "avg_volume_long": _latest_metric(calculate_volume_metrics(price_df, shares_float, timeframe_config), "Avg Volume Long"),
-            "shares_float": shares_float,
+            "avg_volume_short": _latest_metric(metrics_for_summary, "Avg Volume Short"),
+            "avg_volume_medium": _latest_metric(metrics_for_summary, "Avg Volume Medium"),
+            "avg_volume_long": _latest_metric(metrics_for_summary, "Avg Volume Long"),
+            "shares_float": share_count_info.get("share_count") if share_count_info.get("is_true_float") else metadata.get("shares_float"),
+            "share_count_info": share_count_info,
             "finviz_average_volume": metadata.get("average_volume"),
             "finviz_current_volume": metadata.get("volume"),
             "finviz_relative_volume": metadata.get("relative_volume"),
@@ -208,9 +405,10 @@ def classify_volume_history(
     shares_float: float | None = None,
     config: dict | None = None,
     timeframe_config: dict | None = None,
+    share_count_info: dict | None = None,
 ) -> pd.DataFrame:
     timeframe_config = timeframe_config or get_timeframe_config()
-    metrics = calculate_volume_metrics(price_df, shares_float=shares_float, timeframe_config=timeframe_config)
+    metrics = calculate_volume_metrics(price_df, shares_float=shares_float, timeframe_config=timeframe_config, share_count_info=share_count_info)
     if metrics.empty:
         return pd.DataFrame(index=price_df.index)
 
@@ -304,6 +502,13 @@ def _classify_metric_row(
         window: float(latest.get(f"{window}D Float Turnover", np.nan))
         for window in timeframe_config.get("float_turnover_windows", [])
     }
+    turnovers = {
+        window: float(latest.get(f"{window}D Turnover", np.nan))
+        for window in timeframe_config.get("float_turnover_windows", [])
+    }
+    turnover_label = str(latest.get("Turnover Label") or "Turnover unavailable")
+    turnover_type = latest.get("Turnover Type")
+    turnover_warning = latest.get("Turnover Warning")
     return {
         "context": context,
         "adjustment": adjustment,
@@ -325,6 +530,16 @@ def _classify_metric_row(
         "daily_float_turnover": float(latest.get("Daily Float Turnover", np.nan)),
         "five_day_float_turnover": float(latest.get("5D Float Turnover", np.nan)),
         "float_turnovers": float_turnovers,
+        "turnover_available": bool(latest.get("Turnover Available", False)),
+        "turnover_label": turnover_label,
+        "turnover_type": turnover_type,
+        "turnover_source": latest.get("Turnover Source"),
+        "turnover_denominator": float(latest.get("Turnover Denominator", np.nan)),
+        "daily_turnover": float(latest.get("Daily Turnover", np.nan)),
+        "avg_daily_turnover": float(latest.get("Avg Daily Turnover", np.nan)),
+        "five_day_turnover": float(latest.get("5D Turnover", np.nan)),
+        "turnovers": turnovers,
+        "turnover_warning": turnover_warning,
         "explanation": _volume_explanation(
             context=context,
             adjustment=adjustment,
@@ -334,7 +549,8 @@ def _classify_metric_row(
             volume_percentile=volume_percentile,
             daily_return=daily_return,
             above_200=above_200,
-            daily_float_turnover=latest.get("Daily Float Turnover", np.nan),
+            daily_float_turnover=latest.get("Daily Turnover", np.nan),
+            turnover_label=turnover_label,
             timeframe_config=timeframe_config,
         ),
         "warnings": warnings,
@@ -377,9 +593,22 @@ def _history_row(result: dict) -> dict:
         "Dollar Volume": result["dollar_volume"],
         "Daily Float Turnover": result["daily_float_turnover"],
         "5D Float Turnover": result["five_day_float_turnover"],
+        "Turnover Available": result.get("turnover_available", False),
+        "Turnover Label": result.get("turnover_label", "Turnover unavailable"),
+        "Turnover Type": result.get("turnover_type"),
+        "Turnover Source": result.get("turnover_source"),
+        "Turnover Denominator": result.get("turnover_denominator", np.nan),
+        "Daily Turnover": result.get("daily_turnover", np.nan),
+        "Avg Daily Turnover": result.get("avg_daily_turnover", np.nan),
+        "5D Turnover": result.get("five_day_turnover", np.nan),
+        "Turnover Warning": result.get("turnover_warning"),
         **{
             f"{window}D Float Turnover": value
             for window, value in result.get("float_turnovers", {}).items()
+        },
+        **{
+            f"{window}D Turnover": value
+            for window, value in result.get("turnovers", {}).items()
         },
         "Volume Explanation": result["explanation"],
     }
@@ -402,6 +631,7 @@ def _volume_explanation(
     daily_return: float,
     above_200: bool,
     daily_float_turnover: float,
+    turnover_label: str,
     timeframe_config: dict,
 ) -> str:
     preset = timeframe_config.get("preset", DEFAULT_TIMEFRAME_PRESET)
@@ -417,9 +647,9 @@ def _volume_explanation(
     direction = "rising" if daily_return > 0 else "falling" if daily_return < 0 else "flat"
     trend_text = "above" if above_200 else "below"
     float_text = (
-        " Float turnover unavailable because shares float data was not found."
+        " Turnover unavailable because no share-count denominator was found."
         if pd.isna(daily_float_turnover)
-        else f" Daily volume equals {daily_float_turnover:.1%} of the float."
+        else f" Daily volume equals {daily_float_turnover:.1%} of the selected denominator ({turnover_label})."
     )
 
     if context in {"Accumulation", "Breakout Confirmation"}:
@@ -472,3 +702,38 @@ def _latest_metric(frame: pd.DataFrame, column: str):
         return None
     clean = pd.to_numeric(frame[column], errors="coerce").dropna()
     return None if clean.empty else float(clean.iloc[-1])
+
+
+def _number_or_none(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(number) or number <= 0:
+        return None
+    return number
+
+
+def _latest_number(series: pd.Series) -> float | None:
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    return None if clean.empty else float(clean.iloc[-1])
+
+
+def _share_count_result(
+    available: bool,
+    count: float | None,
+    count_type: str | None,
+    source: str | None,
+    is_true_float: bool,
+    warning: str | None = None,
+) -> dict:
+    return {
+        "share_count_available": available,
+        "share_count": count,
+        "share_count_type": count_type,
+        "share_count_source": source,
+        "is_true_float": is_true_float,
+        "warning": warning,
+    }

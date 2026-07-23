@@ -150,11 +150,16 @@ def get_ticker_metadata(ticker: str) -> dict:
     finviz_snapshot = fetch_finviz_ticker_snapshot(normalized_ticker)
     if finviz_snapshot.get("available"):
         fallback = _yfinance_metadata(normalized_ticker)
+        if not _is_missing_metadata_value(finviz_snapshot.get("shares_float")):
+            finviz_snapshot["finviz_shares_float"] = finviz_snapshot.get("shares_float")
+            finviz_snapshot["shares_float_source"] = "finviz"
         for key, value in fallback.items():
             if key in {"available", "source", "ticker", "error"}:
                 continue
             if _is_missing_metadata_value(finviz_snapshot.get(key)) and not _is_missing_metadata_value(value):
                 finviz_snapshot[key] = value
+                if key == "shares_float":
+                    finviz_snapshot["shares_float_source"] = fallback.get("shares_float_source")
         if fallback.get("source") == "yfinance":
             finviz_snapshot["fallback_source"] = "yfinance"
         return finviz_snapshot
@@ -194,7 +199,12 @@ def _yfinance_metadata(ticker: str) -> dict:
         "pc": None,
         "pfcf": None,
         "shares_outstanding": None,
+        "yfinance_shares_outstanding": None,
+        "yfinance_float_shares": None,
+        "yfinance_market_cap": None,
+        "yfinance_price": None,
         "shares_float": MANUAL_FLOAT_SHARES.get(ticker),
+        "shares_float_source": "manual_config" if MANUAL_FLOAT_SHARES.get(ticker) else None,
         "float_percent": None,
         "short_float": None,
         "short_ratio": None,
@@ -238,6 +248,7 @@ def _yfinance_metadata(ticker: str) -> dict:
         result["error"] = str(exc) or exc.__class__.__name__
         return result
 
+    yfinance_float = info.get("floatShares")
     result.update(
         {
             "available": True,
@@ -247,13 +258,17 @@ def _yfinance_metadata(ticker: str) -> dict:
             "industry": info.get("industry"),
             "country": info.get("country"),
             "market_cap": info.get("marketCap"),
+            "yfinance_market_cap": info.get("marketCap"),
             "pe": info.get("trailingPE"),
             "forward_pe": info.get("forwardPE"),
             "peg": info.get("pegRatio"),
             "ps": info.get("priceToSalesTrailing12Months"),
             "pb": info.get("priceToBook"),
             "shares_outstanding": info.get("sharesOutstanding"),
-            "shares_float": info.get("floatShares") or result["shares_float"],
+            "yfinance_shares_outstanding": info.get("sharesOutstanding"),
+            "yfinance_float_shares": yfinance_float,
+            "shares_float": yfinance_float or result["shares_float"],
+            "shares_float_source": "yfinance_floatShares" if yfinance_float else result["shares_float_source"],
             "short_float": _fraction_or_none(info.get("shortPercentOfFloat")),
             "short_ratio": info.get("shortRatio"),
             "short_interest": info.get("sharesShort"),
@@ -268,6 +283,7 @@ def _yfinance_metadata(ticker: str) -> dict:
             "average_volume": info.get("averageVolume"),
             "volume": info.get("volume"),
             "price": info.get("currentPrice") or info.get("regularMarketPrice"),
+            "yfinance_price": info.get("currentPrice") or info.get("regularMarketPrice"),
             "change": info.get("regularMarketChangePercent"),
             "beta": info.get("beta"),
         }

@@ -68,7 +68,7 @@ from scoring import (
     get_regime,
 )
 from swing import SwingResult, build_swing_result
-from volume import get_timeframe_config
+from volume import get_timeframe_config, resolve_share_count_for_turnover
 
 
 KNOWN_ETF_SYMBOLS = {
@@ -174,14 +174,27 @@ def render_dashboard() -> None:
         st.error("Ticker not found or data unavailable.")
         st.stop()
 
-    needs_metadata = active_tab in {"Peers / Sector / Industry / Theme"} or load_advanced_overlays
+    needs_metadata = active_tab in {"Overview", "Peers / Sector / Industry / Theme"} or load_advanced_overlays
     ticker_metadata = get_ticker_metadata(ticker) if needs_metadata else {"available": False, "ticker": ticker}
-    shares_float = ticker_metadata.get("shares_float")
+    latest_price_for_turnover = None
+    if market_data.ticker_ohlcv is not None and not market_data.ticker_ohlcv.empty and "Close" in market_data.ticker_ohlcv.columns:
+        clean_ticker_close = market_data.ticker_ohlcv["Close"].dropna()
+        if not clean_ticker_close.empty:
+            latest_price_for_turnover = _optional_float(clean_ticker_close.iloc[-1])
+    share_count_info = resolve_share_count_for_turnover(
+        ticker=ticker,
+        finviz_metadata=ticker_metadata,
+        yfinance_metadata=ticker_metadata,
+        latest_price=latest_price_for_turnover,
+    )
+    ticker_metadata["share_count_info"] = share_count_info
+    shares_float = share_count_info.get("share_count") if share_count_info.get("is_true_float") else None
     scored = score_history(
         indicators,
         ticker_ohlcv=market_data.ticker_ohlcv,
         shares_float=shares_float,
         volume_timeframe_config=volume_timeframe_config,
+        share_count_info=share_count_info,
     )
     display_scored = _filter_scored_by_timeframe(scored, timeframe_label)
     signals = latest_signal_breakdown(scored, ticker=ticker, benchmark=benchmark)
@@ -396,7 +409,7 @@ def render_dashboard() -> None:
                 ("Volume Preset", volume_preset),
                 ("Volume Control", _preset_choice_label(volume_preset_choice)),
                 ("Swing Vol Control", _preset_choice_label(volatility_preset_choice)),
-                ("Float Turnover", "Finviz avg/current volume"),
+                ("Turnover", "Best available share count"),
                 ("Volatility", f"VIX {lookbacks['vix']}D"),
             ]
         )
@@ -1222,12 +1235,13 @@ def _render_volume_context_card(
     long_window = int(latest.get("Volume Long Window", timeframe_config["volume_long_window"]))
     percentile_window = int(latest.get("Volume Percentile Window", timeframe_config["volume_percentile_window"]))
     percentile_label = "1Y" if percentile_window >= 252 else f"{percentile_window}D"
-    float_turnover_labels = _float_turnover_summary(latest, timeframe_config)
+    turnover_label = str(latest.get("Turnover Label", "Turnover unavailable"))
+    turnover_summary = _float_turnover_summary(latest, timeframe_config)
+    turnover_source = latest.get("Turnover Source") or (ticker_metadata.get("share_count_info") or {}).get("share_count_source")
     finviz_available = ticker_metadata.get("source") == "finviz" and bool(ticker_metadata.get("available"))
     finviz_status = "Available" if finviz_available else "Unavailable"
-    finviz_note = "" if finviz_available else "Finviz data unavailable. Float turnover skipped unless another source provides shares float."
+    turnover_note = _turnover_availability_note(latest, ticker_metadata)
     volume_table = _build_volume_comparison_table(ticker=ticker, ticker_metadata=ticker_metadata, context=context)
-    avg_daily_float_turnover = _metadata_average_float_turnover(ticker_metadata)
     regime_read = _volume_regime_read(
         latest=latest,
         ticker=ticker,
@@ -1245,7 +1259,6 @@ def _render_volume_context_card(
             debug_parts.append(f"Finviz preview URL: {preview_url}")
         if debug_parts:
             debug_note = f'<div class="volume-note">{escape(" | ".join(str(part) for part in debug_parts))}</div>'
-    finviz_note_html = f'<div class="volume-note">{escape(finviz_note)}</div>' if finviz_note else ""
     st.markdown(
         f"""
         <div class="volume-card signal-{status_class}">
@@ -1279,9 +1292,9 @@ def _render_volume_context_card(
                     <small>{percentile_label} selected window</small>
                 </div>
                 <div class="volume-metric">
-                    <span>Float Turnover</span>
-                    <strong>{_format_optional_pct(latest.get("Daily Float Turnover"))}</strong>
-                    <small>{escape(float_turnover_labels)}</small>
+                    <span>{escape(turnover_label)}</span>
+                    <strong>{_format_optional_pct(latest.get("Daily Turnover"))}</strong>
+                    <small>{escape(turnover_summary)}</small>
                 </div>
                 <div class="volume-metric">
                     <span>Finviz RVOL</span>
@@ -1295,10 +1308,14 @@ def _render_volume_context_card(
             </div>
             <div class="volume-foot">
                 <span>Finviz: {finviz_status}</span>
-                <span>Float: {_format_optional_number(ticker_metadata.get("shares_float"))}</span>
-                <span>Current float turnover: {_format_optional_pct(latest.get("Daily Float Turnover"))}</span>
+                <span>Turnover: {"Available" if bool(latest.get("Turnover Available", False)) else "Unavailable"}</span>
+                <span>Type: {escape(turnover_label)}</span>
+                <span>Source: {escape(str(turnover_source or "Unavailable"))}</span>
+                <span>Denominator: {_format_optional_number(latest.get("Turnover Denominator"))}</span>
+                <span>Avg daily turnover: {_format_optional_pct(latest.get("Avg Daily Turnover"))}</span>
+                <span>5D turnover: {_format_optional_pct(latest.get("5D Turnover"))}</span>
                 <span>Float %: {_format_optional_pct(ticker_metadata.get("float_percent"))}</span>
-                <span>{escape(float_turnover_labels)}</span>
+                <span>{escape(turnover_summary)}</span>
                 <span>Trades: {_format_optional_number(ticker_metadata.get("trades"))}</span>
                 <span>RSI: {_format_optional_decimal(ticker_metadata.get("rsi"))}</span>
                 <span>Short ratio: {_format_optional_decimal(ticker_metadata.get("short_ratio"))}</span>
@@ -1308,7 +1325,7 @@ def _render_volume_context_card(
                 <span>{escape(str(ticker_metadata.get("country") or "Country unavailable"))}</span>
             </div>
             {debug_note}
-            {finviz_note_html}
+            <div class="volume-note">{escape(turnover_note)}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1346,23 +1363,26 @@ def _render_turnover_analysis(
         "whether a move has real participation behind it, especially versus the ticker's own norm and peer group."
     )
 
-    current_turnover = _optional_float(latest.get("Daily Float Turnover"))
-    average_turnover = _metadata_average_float_turnover(ticker_metadata)
+    turnover_label = str(latest.get("Turnover Label", "Turnover unavailable"))
+    current_turnover = _optional_float(latest.get("Daily Turnover"))
+    average_turnover = _optional_float(latest.get("Avg Daily Turnover"))
+    five_day_turnover = _optional_float(latest.get("5D Turnover"))
     peer_median_turnover = None
 
     if not volume_table.empty:
         ticker_rows = volume_table.loc[volume_table["Ticker"].astype(str).str.upper() == ticker.upper()]
         if not ticker_rows.empty:
             ticker_row = ticker_rows.iloc[0]
-            current_turnover = _optional_float(ticker_row.get("Current Float Turnover")) or current_turnover
-            average_turnover = _optional_float(ticker_row.get("Avg Daily Float Turnover")) or average_turnover
+            current_turnover = _optional_float(ticker_row.get("Turnover %")) or current_turnover
+            average_turnover = _optional_float(ticker_row.get("Avg Daily Turnover")) or average_turnover
 
-        peer_turnover = pd.to_numeric(
-            volume_table.loc[volume_table["Type"] == "Peer", "Avg Daily Float Turnover"],
-            errors="coerce",
-        ).dropna()
-        if not peer_turnover.empty:
-            peer_median_turnover = float(peer_turnover.median())
+        if "Avg Daily Turnover" in volume_table.columns:
+            peer_turnover = pd.to_numeric(
+                volume_table.loc[volume_table["Type"] == "Peer", "Avg Daily Turnover"],
+                errors="coerce",
+            ).dropna()
+            if not peer_turnover.empty:
+                peer_median_turnover = float(peer_turnover.median())
 
     own_gap = _relative_gap(current_turnover, average_turnover)
     peer_gap = _relative_gap(average_turnover, peer_median_turnover)
@@ -1371,13 +1391,13 @@ def _render_turnover_analysis(
         return None if value is None else f"{value:+.1%}"
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Current Float Turnover", _format_optional_pct(current_turnover), delta=delta_text(own_gap))
-    col2.metric("Avg Daily Float Turnover", _format_optional_pct(average_turnover), delta=delta_text(peer_gap))
+    col1.metric(f"Current {turnover_label}", _format_optional_pct(current_turnover), delta=delta_text(own_gap))
+    col2.metric("Avg Daily Turnover", _format_optional_pct(average_turnover), delta=delta_text(peer_gap))
     col3.metric("Peer Median Avg Turnover", _format_optional_pct(peer_median_turnover))
-    col4.metric("Finviz Float", _format_optional_number(ticker_metadata.get("shares_float")))
+    col4.metric("5D Turnover", _format_optional_pct(five_day_turnover))
 
     if current_turnover is None:
-        st.info("Float turnover needs shares-float metadata. If Finviz cannot provide float for this ticker, turnover is unavailable.")
+        st.info("Turnover unavailable because no share-count denominator was found. RVOL, volume percentile, and dollar volume still calculate.")
         return
 
     if own_gap is not None and own_gap >= 0.5:
@@ -1390,6 +1410,9 @@ def _render_turnover_analysis(
     if peer_gap is not None:
         peer_read = "above" if peer_gap > 0 else "below"
         read += f" Its average turnover is {abs(peer_gap):.0%} {peer_read} the peer median."
+    warning = latest.get("Turnover Warning")
+    if isinstance(warning, str) and warning:
+        st.warning(warning)
     st.info(read)
 
 
@@ -1433,9 +1456,18 @@ def _build_volume_comparison_table(ticker: str, ticker_metadata: dict, context) 
         metadata = metadata_map.get(symbol, {})
         volume = _optional_float(metadata.get("volume"))
         average_volume = _optional_float(metadata.get("average_volume"))
-        shares_float = _optional_float(metadata.get("shares_float"))
-        current_float_turnover = volume / shares_float if volume is not None and shares_float else None
-        average_float_turnover = average_volume / shares_float if average_volume is not None and shares_float else None
+        share_count_info = resolve_share_count_for_turnover(
+            ticker=symbol,
+            finviz_metadata=metadata,
+            yfinance_metadata=metadata,
+            latest_price=metadata.get("price"),
+        )
+        denominator = _optional_float(share_count_info.get("share_count"))
+        is_true_float = bool(share_count_info.get("is_true_float"))
+        current_turnover = volume / denominator if volume is not None and denominator else None
+        average_turnover = average_volume / denominator if average_volume is not None and denominator else None
+        current_float_turnover = current_turnover if is_true_float else None
+        average_float_turnover = average_turnover if is_true_float else None
         rows.append(
             {
                 "Asset": label,
@@ -1444,7 +1476,13 @@ def _build_volume_comparison_table(ticker: str, ticker_metadata: dict, context) 
                 "Finviz RVOL": _optional_float(metadata.get("relative_volume")),
                 "Volume": volume,
                 "Avg Volume": average_volume,
-                "Float": shares_float,
+                "Float": _optional_float(metadata.get("shares_float")),
+                "Turnover %": current_turnover,
+                "Avg Daily Turnover": average_turnover,
+                "Turnover Type": "Float Turnover" if is_true_float else "Share Turnover Proxy" if denominator else "Unavailable",
+                "Turnover Source": share_count_info.get("share_count_source") or "Unavailable",
+                "Turnover Denominator": denominator,
+                "Turnover Warning": share_count_info.get("warning"),
                 "Current Float Turnover": current_float_turnover,
                 "Avg Daily Float Turnover": average_float_turnover,
                 "Float %": _optional_float(metadata.get("float_percent")),
@@ -1488,6 +1526,10 @@ def _style_volume_comparison_table(table: pd.DataFrame):
             "Avg Volume",
             "Gap",
             "Change From Open",
+            "Turnover %",
+            "Avg Daily Turnover",
+            "Turnover Type",
+            "Turnover Source",
             "Avg Daily Float Turnover",
             "Current Float Turnover",
             "Float %",
@@ -1507,6 +1549,8 @@ def _style_volume_comparison_table(table: pd.DataFrame):
                 "Avg Volume": lambda value: "N/A" if pd.isna(value) else _format_optional_number(value),
                 "Gap": lambda value: "N/A" if pd.isna(value) else f"{value:.1%}",
                 "Change From Open": lambda value: "N/A" if pd.isna(value) else f"{value:.1%}",
+                "Turnover %": lambda value: "N/A" if pd.isna(value) else f"{value:.1%}",
+                "Avg Daily Turnover": lambda value: "N/A" if pd.isna(value) else f"{value:.1%}",
                 "Avg Daily Float Turnover": lambda value: "N/A" if pd.isna(value) else f"{value:.1%}",
                 "Current Float Turnover": lambda value: "N/A" if pd.isna(value) else f"{value:.1%}",
                 "Float %": lambda value: "N/A" if pd.isna(value) else f"{value:.1%}",
@@ -1518,7 +1562,7 @@ def _style_volume_comparison_table(table: pd.DataFrame):
         )
         .map(_rvol_style, subset=["Finviz RVOL"])
         .map(_gap_style, subset=["RVOL vs Peer Median", "RVOL vs Sector"])
-        .map(_performance_pct_style, subset=["Gap", "Change From Open"])
+        .map(_performance_pct_style, subset=["Gap", "Change From Open", "Turnover %", "Avg Daily Turnover"])
         .set_properties(
             subset=["Ticker", "Type"],
             **{"font-weight": "700", "color": "#e5e7eb"},
@@ -1741,11 +1785,23 @@ def _load_peer_regime_histories(
             if indicators.empty:
                 continue
             metadata = get_ticker_metadata(symbol)
+            latest_price = None
+            if market_data.ticker_ohlcv is not None and not market_data.ticker_ohlcv.empty and "Close" in market_data.ticker_ohlcv.columns:
+                clean_close = market_data.ticker_ohlcv["Close"].dropna()
+                if not clean_close.empty:
+                    latest_price = _optional_float(clean_close.iloc[-1])
+            share_count_info = resolve_share_count_for_turnover(
+                ticker=symbol,
+                finviz_metadata=metadata,
+                yfinance_metadata=metadata,
+                latest_price=latest_price,
+            )
             scored = score_history(
                 indicators,
                 ticker_ohlcv=market_data.ticker_ohlcv,
-                shares_float=metadata.get("shares_float"),
+                shares_float=share_count_info.get("share_count") if share_count_info.get("is_true_float") else None,
                 volume_timeframe_config=volume_timeframe_config,
+                share_count_info=share_count_info,
             )
             if not scored.empty:
                 histories[symbol] = scored
@@ -1756,10 +1812,12 @@ def _load_peer_regime_histories(
 
 def _average_float_turnover_chart(volume_table: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
-    chart_data = volume_table.dropna(subset=["Avg Daily Float Turnover"]).copy()
+    value_column = "Avg Daily Turnover" if "Avg Daily Turnover" in volume_table.columns else "Avg Daily Float Turnover"
+    chart_data = volume_table.dropna(subset=[value_column]).copy()
+    title = _turnover_chart_title(chart_data)
     if chart_data.empty:
         fig.add_annotation(
-            text="Average daily float-turnover is unavailable for these assets.",
+            text="Average daily turnover is unavailable for these assets.",
             x=0.5,
             y=0.5,
             xref="paper",
@@ -1767,21 +1825,21 @@ def _average_float_turnover_chart(volume_table: pd.DataFrame) -> go.Figure:
             showarrow=False,
             font=dict(color="#cbd5e1", size=13),
         )
-        return _finish_chart(fig, title="Average Daily Float Turnover")
+        return _finish_chart(fig, title=title)
 
-    chart_data = chart_data.sort_values("Avg Daily Float Turnover", ascending=False)
+    chart_data = chart_data.sort_values(value_column, ascending=False)
     colors = ["#38bdf8" if asset_type == "Ticker" else "#14b8a6" if "Proxy" in asset_type or "ETF" in asset_type else "#64748b" for asset_type in chart_data["Type"]]
     fig.add_trace(
         go.Bar(
             x=chart_data["Ticker"],
-            y=chart_data["Avg Daily Float Turnover"],
-            name="Avg daily float turnover",
+            y=chart_data[value_column],
+            name=title,
             marker=dict(color=colors),
-            hovertemplate="%{x}<br>Avg Daily Float Turnover: %{y:.1%}<extra></extra>",
+            hovertemplate=f"%{{x}}<br>{title}: %{{y:.1%}}<extra></extra>",
         )
     )
     fig.update_yaxes(tickformat=".1%")
-    return _finish_chart(fig, title="Average Daily Float Turnover")
+    return _finish_chart(fig, title=title)
 
 
 def _peer_regime_score_chart(
@@ -1992,10 +2050,40 @@ def _relative_gap(value, baseline) -> float | None:
 
 def _metadata_average_float_turnover(metadata: dict) -> float | None:
     average_volume = _optional_float(metadata.get("average_volume"))
-    shares_float = _optional_float(metadata.get("shares_float"))
-    if average_volume is None or not shares_float:
+    share_count_info = resolve_share_count_for_turnover(
+        ticker=str(metadata.get("ticker") or ""),
+        finviz_metadata=metadata,
+        yfinance_metadata=metadata,
+        latest_price=metadata.get("price"),
+    )
+    denominator = _optional_float(share_count_info.get("share_count"))
+    if average_volume is None or not denominator:
         return None
-    return average_volume / shares_float
+    return average_volume / denominator
+
+
+def _turnover_availability_note(latest: pd.Series, metadata: dict) -> str:
+    label = str(latest.get("Turnover Label", "Turnover unavailable"))
+    source = latest.get("Turnover Source") or (metadata.get("share_count_info") or {}).get("share_count_source")
+    warning = latest.get("Turnover Warning")
+    if bool(latest.get("Turnover Available", False)):
+        if label == "Float Turnover":
+            return f"Float turnover calculated using shares float. Source: {source or 'available metadata'}."
+        if source == "estimated":
+            return "Share turnover proxy estimated from market cap / price. Use as directional only."
+        return "Share turnover proxy calculated using shares outstanding. True float is unavailable, so this is not exact float turnover."
+    return str(warning or "Turnover unavailable because no share-count denominator was found. RVOL, volume percentile, and dollar volume are still calculated.")
+
+
+def _turnover_chart_title(chart_data: pd.DataFrame) -> str:
+    if chart_data.empty or "Turnover Type" not in chart_data.columns:
+        return "Average Daily Turnover"
+    labels = set(str(value) for value in chart_data["Turnover Type"].dropna().unique())
+    if labels == {"Float Turnover"}:
+        return "Average Daily Float Turnover"
+    if labels and labels.issubset({"Share Turnover Proxy"}):
+        return "Average Daily Share Turnover Proxy"
+    return "Average Daily Turnover"
 
 
 def _optional_float(value) -> float | None:
@@ -4988,12 +5076,13 @@ def _float_turnover_summary(latest: pd.Series, timeframe_config: dict) -> str:
     parts = []
     for window in timeframe_config.get("float_turnover_windows", []):
         label = "Daily" if int(window) == 1 else f"{int(window)}D"
-        column = "Daily Float Turnover" if int(window) == 1 else f"{int(window)}D Float Turnover"
+        column = "Daily Turnover" if int(window) == 1 else f"{int(window)}D Turnover"
         value = latest.get(column)
         if pd.isna(value):
             continue
         parts.append(f"{label}: {float(value):.1%}")
-    return " / ".join(parts) if parts else "Float turnover unavailable"
+    turnover_label = str(latest.get("Turnover Label", "Turnover"))
+    return " / ".join(parts) if parts else f"{turnover_label} unavailable"
 
 
 def _volume_status_class(context: str) -> str:

@@ -23,6 +23,7 @@ from config import (
 )
 from data import normalize_ticker
 from finviz_fetcher import configured_finviz_columns, fetch_finviz_export, normalize_finviz_dataframe, remove_dead_local_proxy
+from volume import calculate_turnover_metrics, resolve_share_count_for_turnover
 
 
 SCREENER_TIMEFRAME_WINDOWS = {
@@ -1158,15 +1159,25 @@ def _build_feature_row(
     avg_volume20 = _last_sma(volume, 20)
     avg_volume50 = _last_sma(volume, 50)
     ticker_metadata = ticker_metadata or {}
-    shares_float = _number(ticker_metadata.get("shares_float"))
-    metadata_avg_volume = _number(ticker_metadata.get("average_volume"))
-    avg_volume_for_turnover = metadata_avg_volume if metadata_avg_volume is not None else avg_volume50
-    current_float_turnover = current_volume / shares_float if shares_float and math.isfinite(current_volume) else np.nan
-    average_float_turnover = (
-        avg_volume_for_turnover / shares_float
-        if shares_float and avg_volume_for_turnover is not None and math.isfinite(float(avg_volume_for_turnover))
-        else np.nan
+    share_count_info = resolve_share_count_for_turnover(
+        ticker=ticker,
+        finviz_metadata=ticker_metadata,
+        yfinance_metadata=ticker_metadata,
+        latest_price=price,
     )
+    turnover_metrics = calculate_turnover_metrics(
+        ohlcv,
+        share_count_info,
+        volume_window=50,
+        five_day_window=5,
+    )
+    denominator = _number(turnover_metrics.get("denominator"))
+    is_true_float = bool(share_count_info.get("is_true_float"))
+    shares_float = denominator if is_true_float else np.nan
+    current_turnover = turnover_metrics.get("daily_turnover")
+    average_turnover = turnover_metrics.get("avg_daily_turnover")
+    current_float_turnover = current_turnover if is_true_float else np.nan
+    average_float_turnover = average_turnover if is_true_float else np.nan
     rvol20 = current_volume / avg_volume20 if avg_volume20 and avg_volume20 > 0 else np.nan
     volume_percentile = _volume_percentile(volume)
     atr_pct = _atr_pct(ohlcv)
@@ -1194,9 +1205,15 @@ def _build_feature_row(
         "Avg Volume 50D": avg_volume50,
         "Dollar Volume": dollar_volume,
         "Shares Float": shares_float if shares_float is not None else np.nan,
+        "Turnover %": current_turnover if current_turnover is not None else np.nan,
+        "Average Daily Turnover": average_turnover if average_turnover is not None else np.nan,
+        "5D Turnover": turnover_metrics.get("five_day_turnover") if turnover_metrics.get("five_day_turnover") is not None else np.nan,
+        "Turnover Type": turnover_metrics.get("turnover_label", "Turnover unavailable"),
+        "Turnover Source": turnover_metrics.get("denominator_source") or "Unavailable",
+        "Turnover Warning": turnover_metrics.get("warning"),
+        "Turnover Denominator": denominator if denominator is not None else np.nan,
         "Current Float Turnover": current_float_turnover,
         "Average Daily Float Turnover": average_float_turnover,
-        "Turnover Source": "Finviz avg volume" if metadata_avg_volume is not None else "OHLCV 50D avg volume" if shares_float else "Unavailable",
         "RVOL 20D": rvol20,
         "Volume Percentile": volume_percentile,
         "Distribution Warning": bool(one_day_return < -0.02 and (rvol20 if math.isfinite(rvol20) else 0) >= 1.5),
@@ -1341,7 +1358,7 @@ def render_bucket_chart(
     chart_map = {
         "Combined Overlay Score": "Combined Overlay Score",
         "Momentum Trend Score": "Momentum Trend Score",
-        "Average Daily Float Turnover": "Average Daily Float Turnover",
+        "Average Daily Float Turnover": "Average Daily Turnover",
         "RS vs Target": "RS vs Target",
         "RS vs Benchmark": "RS vs Benchmark",
         "RS vs QQQ": "RS vs Benchmark",
@@ -1357,6 +1374,7 @@ def render_bucket_chart(
         st.info(f"{chart_type} is unavailable for this bucket.")
         return
 
+    chart_title = _bucket_turnover_chart_title(bucket_df) if chart_type == "Average Daily Float Turnover" else chart_type
     chart_df = bucket_df[["Ticker", column]].copy()
     chart_df[column] = pd.to_numeric(chart_df[column], errors="coerce")
     chart_df = chart_df.dropna(subset=[column])
@@ -1404,7 +1422,7 @@ def render_bucket_chart(
                 annotation_text=f"{normalize_ticker(target_ticker)} reference",
             )
     fig.update_layout(
-        title=f"{bucket_name} - {chart_type}",
+        title=f"{bucket_name} - {chart_title}",
         height=430,
         margin=dict(l=20, r=20, t=55, b=40),
         template="plotly_dark",
@@ -1412,6 +1430,17 @@ def render_bucket_chart(
         xaxis_title="Ticker",
     )
     st.plotly_chart(fig, width="stretch", key=f"bucket_chart_{bucket_name}_{chart_type}")
+
+
+def _bucket_turnover_chart_title(bucket_df: pd.DataFrame) -> str:
+    if bucket_df.empty or "Turnover Type" not in bucket_df.columns:
+        return "Average Daily Turnover"
+    labels = set(str(value) for value in bucket_df["Turnover Type"].dropna().unique())
+    if labels == {"Float Turnover"}:
+        return "Average Daily Float Turnover"
+    if labels and labels.issubset({"Share Turnover Proxy"}):
+        return "Average Daily Share Turnover Proxy"
+    return "Average Daily Turnover"
 
 
 def calculate_overlay_history_for_bucket_tickers(
@@ -1764,9 +1793,14 @@ def _bucket_detail_columns(bucket_df: pd.DataFrame) -> pd.DataFrame:
         "Override Mode",
         "Combined Overlay Score",
         "Shares Float",
+        "Turnover %",
+        "Average Daily Turnover",
+        "5D Turnover",
+        "Turnover Type",
+        "Turnover Source",
+        "Turnover Denominator",
         "Current Float Turnover",
         "Average Daily Float Turnover",
-        "Turnover Source",
         "RS vs Theme",
         "RS vs Peer Median",
         "RS vs Sector",
@@ -1779,6 +1813,9 @@ def _bucket_detail_columns(bucket_df: pd.DataFrame) -> pd.DataFrame:
     for column in [
         "Current Float Turnover",
         "Average Daily Float Turnover",
+        "Turnover %",
+        "Average Daily Turnover",
+        "5D Turnover",
         "RS vs Theme",
         "RS vs Peer Median",
         "RS vs Sector",
@@ -1804,6 +1841,10 @@ def _bucket_detail_column_config() -> dict:
         "Override Applied": st.column_config.CheckboxColumn("Override Applied"),
         "Combined Overlay Score": st.column_config.ProgressColumn("Overlay", min_value=0, max_value=100, format="%.0f"),
         "Shares Float": st.column_config.NumberColumn("Shares Float", format="%.0f"),
+        "Turnover %": st.column_config.NumberColumn("Turnover %", format="%.1f%%"),
+        "Average Daily Turnover": st.column_config.NumberColumn("Avg Daily Turnover", format="%.1f%%"),
+        "5D Turnover": st.column_config.NumberColumn("5D Turnover", format="%.1f%%"),
+        "Turnover Denominator": st.column_config.NumberColumn("Turnover Denominator", format="%.0f"),
         "Current Float Turnover": st.column_config.NumberColumn("Current Float Turnover", format="%.1f%%"),
         "Average Daily Float Turnover": st.column_config.NumberColumn("Avg Daily Float Turnover", format="%.1f%%"),
         "RS vs Theme": st.column_config.NumberColumn("RS vs Theme", format="%.1f%%"),
@@ -1935,8 +1976,9 @@ def _render_selected_ticker_preview(df: pd.DataFrame, timeframe: str, benchmark:
     c8.metric("Dollar Volume", _format_dollar(row.get("Dollar Volume")))
     c9.metric("ATR Risk", _format_pct(row.get("ATR %")))
     c10, c11, c12 = st.columns(3)
-    c10.metric("Avg Float Turnover", _format_pct(row.get("Average Daily Float Turnover")))
-    c11.metric("Current Float Turnover", _format_pct(row.get("Current Float Turnover")))
+    turnover_label = str(row.get("Turnover Type", "Turnover"))
+    c10.metric("Avg Daily Turnover", _format_pct(row.get("Average Daily Turnover")))
+    c11.metric(f"Current {turnover_label}", _format_pct(row.get("Turnover %")))
     c12.metric("Turnover Source", str(row.get("Turnover Source", "Unavailable")))
 
     score_columns = [
@@ -2043,9 +2085,14 @@ def _advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Price",
         "Dollar Volume",
         "Shares Float",
+        "Turnover %",
+        "Average Daily Turnover",
+        "5D Turnover",
+        "Turnover Type",
+        "Turnover Source",
+        "Turnover Denominator",
         "Average Daily Float Turnover",
         "Current Float Turnover",
-        "Turnover Source",
         "RVOL 20D",
         "ATR %",
         "Distance 50D SMA",
@@ -2070,6 +2117,9 @@ def _advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
         "RS vs Industry",
         "Volume Percentile",
         "Recent Drawdown",
+        "Turnover %",
+        "Average Daily Turnover",
+        "5D Turnover",
     ]:
         if column in display.columns:
             display[column] = display[column] * 100
@@ -2093,6 +2143,10 @@ def _advanced_column_config() -> dict:
         "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
         "Dollar Volume": st.column_config.NumberColumn("Dollar Volume", format="$%.0f"),
         "Shares Float": st.column_config.NumberColumn("Shares Float", format="%.0f"),
+        "Turnover %": st.column_config.NumberColumn("Turnover %", format="%.1f%%"),
+        "Average Daily Turnover": st.column_config.NumberColumn("Avg Daily Turnover", format="%.1f%%"),
+        "5D Turnover": st.column_config.NumberColumn("5D Turnover", format="%.1f%%"),
+        "Turnover Denominator": st.column_config.NumberColumn("Turnover Denominator", format="%.0f"),
         "Average Daily Float Turnover": st.column_config.NumberColumn("Avg Daily Float Turnover", format="%.1f%%"),
         "Current Float Turnover": st.column_config.NumberColumn("Current Float Turnover", format="%.1f%%"),
         "RVOL 20D": st.column_config.NumberColumn("RVOL", format="%.2f"),
