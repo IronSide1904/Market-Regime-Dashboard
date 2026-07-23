@@ -22,7 +22,7 @@ from config import (
     SECTOR_ETF_MAP,
 )
 from data import normalize_ticker
-from finviz_fetcher import remove_dead_local_proxy
+from finviz_fetcher import configured_finviz_columns, fetch_finviz_export, normalize_finviz_dataframe, remove_dead_local_proxy
 
 
 SCREENER_TIMEFRAME_WINDOWS = {
@@ -369,6 +369,34 @@ def fetch_screener_data(tickers: list[str], period: str = "2y", interval: str = 
     return _split_downloaded_ohlcv(downloaded=downloaded, tickers=clean_tickers)
 
 
+@st.cache_data(ttl=int(SCREENER_CONFIG["cache_ttl_seconds"]), show_spinner=False)
+def fetch_screener_metadata(tickers: list[str]) -> dict[str, dict]:
+    clean_tickers = normalize_ticker_list(tickers)
+    metadata: dict[str, dict] = {ticker: {"available": False, "ticker": ticker, "source": "finviz"} for ticker in clean_tickers}
+    if not clean_tickers:
+        return metadata
+    try:
+        normalized = normalize_finviz_dataframe(fetch_finviz_export(columns=configured_finviz_columns()))
+    except Exception as exc:
+        error = str(exc)
+        for ticker in clean_tickers:
+            metadata[ticker]["error"] = error
+        return metadata
+    if normalized.empty or "ticker" not in normalized.columns:
+        return metadata
+    normalized = normalized.copy()
+    normalized["ticker"] = normalized["ticker"].astype(str).str.upper()
+    for ticker in clean_tickers:
+        rows = normalized.loc[normalized["ticker"] == ticker]
+        if rows.empty:
+            metadata[ticker]["error"] = "Ticker not found in Finviz export."
+            continue
+        row = rows.iloc[0].to_dict()
+        row.update({"available": True, "source": "finviz", "error": None})
+        metadata[ticker] = row
+    return metadata
+
+
 def calculate_screener_features(
     ticker_data: dict[str, pd.DataFrame],
     benchmark_data: dict[str, pd.DataFrame],
@@ -391,6 +419,7 @@ def calculate_screener_features(
     for ticker, frame in ticker_data.items():
         if not include_benchmarks and ticker in {benchmark_symbol, market_symbol}:
             continue
+        ticker_metadata = metadata.get(ticker, {}) if isinstance(metadata, dict) else {}
         row = _build_feature_row(
             ticker=ticker,
             frame=frame,
@@ -398,6 +427,7 @@ def calculate_screener_features(
             window=window,
             benchmark_return=benchmark_return,
             market_return=market_return,
+            ticker_metadata=ticker_metadata,
         )
         if row:
             row["Bucket"] = _bucket_label(buckets.get(ticker, []))
@@ -602,6 +632,8 @@ def render_screener_tab() -> None:
     all_symbols = normalize_ticker_list([*universe_tickers, controls["benchmark"], controls["market_benchmark"]])
     with st.spinner(f"Screening {len(universe_tickers)} tickers..."):
         all_data = fetch_screener_data(all_symbols, period=period)
+    with st.spinner("Loading Finviz float / turnover metadata..."):
+        screener_metadata = fetch_screener_metadata(universe_tickers)
 
     benchmark = all_data.get(controls["benchmark"])
     market = all_data.get(controls["market_benchmark"])
@@ -629,6 +661,7 @@ def render_screener_tab() -> None:
         },
         theme_tickers=controls.get("theme_tickers", universe_tickers),
         timeframe=controls["timeframe"],
+        metadata=screener_metadata,
     )
     scored = calculate_momentum_trend_score(features)
     filtered = _apply_screener_filters(scored, controls)
@@ -1104,6 +1137,7 @@ def _build_feature_row(
     window: int,
     benchmark_return: float,
     market_return: float,
+    ticker_metadata: dict | None = None,
 ) -> dict | None:
     ohlcv = _clean_ohlcv(frame)
     if ohlcv.shape[0] < max(60, min(window + 5, 252)):
@@ -1123,6 +1157,16 @@ def _build_feature_row(
     sma200 = _last_sma(close, 200)
     avg_volume20 = _last_sma(volume, 20)
     avg_volume50 = _last_sma(volume, 50)
+    ticker_metadata = ticker_metadata or {}
+    shares_float = _number(ticker_metadata.get("shares_float"))
+    metadata_avg_volume = _number(ticker_metadata.get("average_volume"))
+    avg_volume_for_turnover = metadata_avg_volume if metadata_avg_volume is not None else avg_volume50
+    current_float_turnover = current_volume / shares_float if shares_float and math.isfinite(current_volume) else np.nan
+    average_float_turnover = (
+        avg_volume_for_turnover / shares_float
+        if shares_float and avg_volume_for_turnover is not None and math.isfinite(float(avg_volume_for_turnover))
+        else np.nan
+    )
     rvol20 = current_volume / avg_volume20 if avg_volume20 and avg_volume20 > 0 else np.nan
     volume_percentile = _volume_percentile(volume)
     atr_pct = _atr_pct(ohlcv)
@@ -1149,7 +1193,10 @@ def _build_feature_row(
         "Avg Volume 20D": avg_volume20,
         "Avg Volume 50D": avg_volume50,
         "Dollar Volume": dollar_volume,
-        "Average Daily Float Turnover": np.nan,
+        "Shares Float": shares_float if shares_float is not None else np.nan,
+        "Current Float Turnover": current_float_turnover,
+        "Average Daily Float Turnover": average_float_turnover,
+        "Turnover Source": "Finviz avg volume" if metadata_avg_volume is not None else "OHLCV 50D avg volume" if shares_float else "Unavailable",
         "RVOL 20D": rvol20,
         "Volume Percentile": volume_percentile,
         "Distribution Warning": bool(one_day_return < -0.02 and (rvol20 if math.isfinite(rvol20) else 0) >= 1.5),
@@ -1316,10 +1363,6 @@ def render_bucket_chart(
     if chart_df.empty:
         st.info(f"{chart_type} unavailable for this bucket.")
         return
-    if chart_type == "Average Daily Float Turnover":
-        st.info("Float turnover unavailable for this bucket.")
-        return
-
     percent_chart = chart_type in {
         "RS vs Target",
         "RS vs Benchmark",
@@ -1328,6 +1371,7 @@ def render_bucket_chart(
         "RS vs SPY",
         "RS vs Theme",
         "Timeframe Return",
+        "Average Daily Float Turnover",
         "ATR % / Risk",
         "ATR % Price",
     }
@@ -1719,6 +1763,10 @@ def _bucket_detail_columns(bucket_df: pd.DataFrame) -> pd.DataFrame:
         "Override Applied",
         "Override Mode",
         "Combined Overlay Score",
+        "Shares Float",
+        "Current Float Turnover",
+        "Average Daily Float Turnover",
+        "Turnover Source",
         "RS vs Theme",
         "RS vs Peer Median",
         "RS vs Sector",
@@ -1728,7 +1776,14 @@ def _bucket_detail_columns(bucket_df: pd.DataFrame) -> pd.DataFrame:
     if not existing:
         return pd.DataFrame()
     display = bucket_df[existing].copy()
-    for column in ["RS vs Theme", "RS vs Peer Median", "RS vs Sector", "RS vs Industry"]:
+    for column in [
+        "Current Float Turnover",
+        "Average Daily Float Turnover",
+        "RS vs Theme",
+        "RS vs Peer Median",
+        "RS vs Sector",
+        "RS vs Industry",
+    ]:
         if column in display.columns:
             display[column] = display[column] * 100
     return display
@@ -1748,6 +1803,9 @@ def _bucket_detail_column_config() -> dict:
     return {
         "Override Applied": st.column_config.CheckboxColumn("Override Applied"),
         "Combined Overlay Score": st.column_config.ProgressColumn("Overlay", min_value=0, max_value=100, format="%.0f"),
+        "Shares Float": st.column_config.NumberColumn("Shares Float", format="%.0f"),
+        "Current Float Turnover": st.column_config.NumberColumn("Current Float Turnover", format="%.1f%%"),
+        "Average Daily Float Turnover": st.column_config.NumberColumn("Avg Daily Float Turnover", format="%.1f%%"),
         "RS vs Theme": st.column_config.NumberColumn("RS vs Theme", format="%.1f%%"),
         "RS vs Peer Median": st.column_config.NumberColumn("RS vs Peer Median", format="%.1f%%"),
         "RS vs Sector": st.column_config.NumberColumn("RS vs Sector", format="%.1f%%"),
@@ -1876,6 +1934,10 @@ def _render_selected_ticker_preview(df: pd.DataFrame, timeframe: str, benchmark:
     c7.metric("Price", _format_price(row.get("Price")))
     c8.metric("Dollar Volume", _format_dollar(row.get("Dollar Volume")))
     c9.metric("ATR Risk", _format_pct(row.get("ATR %")))
+    c10, c11, c12 = st.columns(3)
+    c10.metric("Avg Float Turnover", _format_pct(row.get("Average Daily Float Turnover")))
+    c11.metric("Current Float Turnover", _format_pct(row.get("Current Float Turnover")))
+    c12.metric("Turnover Source", str(row.get("Turnover Source", "Unavailable")))
 
     score_columns = [
         "Price Trend Score",
@@ -1980,6 +2042,10 @@ def _advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Industry",
         "Price",
         "Dollar Volume",
+        "Shares Float",
+        "Average Daily Float Turnover",
+        "Current Float Turnover",
+        "Turnover Source",
         "RVOL 20D",
         "ATR %",
         "Distance 50D SMA",
@@ -2026,6 +2092,9 @@ def _advanced_column_config() -> dict:
         "Override Applied": st.column_config.CheckboxColumn("Override Applied"),
         "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
         "Dollar Volume": st.column_config.NumberColumn("Dollar Volume", format="$%.0f"),
+        "Shares Float": st.column_config.NumberColumn("Shares Float", format="%.0f"),
+        "Average Daily Float Turnover": st.column_config.NumberColumn("Avg Daily Float Turnover", format="%.1f%%"),
+        "Current Float Turnover": st.column_config.NumberColumn("Current Float Turnover", format="%.1f%%"),
         "RVOL 20D": st.column_config.NumberColumn("RVOL", format="%.2f"),
         "ATR %": st.column_config.NumberColumn("ATR %", format="%.1f%%"),
         "Distance 50D SMA": st.column_config.NumberColumn("Dist 50D", format="%.1f%%"),
