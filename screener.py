@@ -422,6 +422,12 @@ def render_screener_tab() -> None:
 
     if not controls["run"]:
         st.info("Set the controls, then click **Run Screener**.")
+        if SCREENER_BUCKET_ANALYSIS_CONFIG.get("enabled", True):
+            st.subheader("Bucket Analysis")
+            st.info(
+                "Run the screener to populate Target, Direct Peers, Theme Peers, Benchmarks, "
+                "bucket charts, and the All Buckets Overlay."
+            )
         return
 
     period = SCREENER_PERIODS.get(controls["timeframe"], "2y")
@@ -476,6 +482,14 @@ def render_screener_tab() -> None:
 
     if sorted_df.empty:
         st.warning("No tickers passed the selected filters.")
+        render_bucket_analysis_section(
+            results_df=scored,
+            target_ticker=controls.get("target_ticker"),
+            ticker_data=ticker_data,
+            benchmark=controls["benchmark"],
+            market_benchmark=controls["market_benchmark"],
+            timeframe=controls["timeframe"],
+        )
         return
 
     display_df = _display_columns(sorted_df, include_target=controls.get("mode") == "Ticker Comparison")
@@ -497,14 +511,6 @@ def render_screener_tab() -> None:
             column_config=_column_config(),
         )
 
-    with st.expander("Advanced screener columns", expanded=False):
-        st.dataframe(
-            _advanced_columns(sorted_df),
-            use_container_width=True,
-            hide_index=True,
-            column_config=_advanced_column_config(),
-        )
-
     render_bucket_analysis_section(
         results_df=scored,
         target_ticker=controls.get("target_ticker"),
@@ -513,6 +519,14 @@ def render_screener_tab() -> None:
         market_benchmark=controls["market_benchmark"],
         timeframe=controls["timeframe"],
     )
+
+    with st.expander("Advanced screener columns", expanded=False):
+        st.dataframe(
+            _advanced_columns(sorted_df),
+            use_container_width=True,
+            hide_index=True,
+            column_config=_advanced_column_config(),
+        )
 
     _render_selected_ticker_preview(sorted_df, timeframe=controls["timeframe"], benchmark=controls["benchmark"])
 
