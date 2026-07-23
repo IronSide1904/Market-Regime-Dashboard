@@ -635,6 +635,12 @@ def render_screener_tab() -> None:
     col_c.metric("Skipped", f"{len(skipped)}")
     if skipped:
         st.caption(f"Skipped missing data: {', '.join(skipped[:20])}{'...' if len(skipped) > 20 else ''}")
+    _render_screener_control_impact(
+        controls=controls,
+        scored_count=len(scored),
+        filtered_count=len(filtered),
+        shown_count=len(sorted_df),
+    )
 
     if sorted_df.empty:
         st.warning("No tickers passed the selected filters.")
@@ -657,15 +663,23 @@ def render_screener_tab() -> None:
             ),
             use_container_width=True,
             hide_index=True,
-            column_config=_column_config(),
+            column_config=_column_config(
+                benchmark=controls["benchmark"],
+                market_benchmark=controls["market_benchmark"],
+            ),
         )
     else:
         st.dataframe(
             display_df,
             use_container_width=True,
             hide_index=True,
-            column_config=_column_config(),
+            column_config=_column_config(
+                benchmark=controls["benchmark"],
+                market_benchmark=controls["market_benchmark"],
+            ),
         )
+
+    _render_selected_ticker_preview(sorted_df, timeframe=controls["timeframe"], benchmark=controls["benchmark"])
 
     render_bucket_analysis_section(
         results_df=scored,
@@ -684,8 +698,6 @@ def render_screener_tab() -> None:
             column_config=_advanced_column_config(),
         )
 
-    _render_selected_ticker_preview(sorted_df, timeframe=controls["timeframe"], benchmark=controls["benchmark"])
-
 
 def _render_screener_controls() -> dict:
     default_mode = str(SCREENER_TARGET_TICKER_CONFIG.get("default_mode", "Ticker Comparison"))
@@ -699,6 +711,7 @@ def _render_screener_controls() -> dict:
             "Screener mode",
             SCREENER_MODES,
             index=SCREENER_MODES.index(str(preset.get("mode", default_mode))) if str(preset.get("mode", default_mode)) in SCREENER_MODES else 0,
+            help="Controls where the ticker universe comes from: target comparison peers, theme list, manual list, or sector ETF list.",
         )
         target_universe = build_ticker_comparison_universe(
             target_ticker=target_ticker,
@@ -714,31 +727,59 @@ def _render_screener_controls() -> dict:
                 "Theme group",
                 theme_options,
                 index=theme_options.index(theme_default) if theme_default in theme_options else 0,
+                help="Controls theme peers and the median used for RS vs Theme. In Ticker Comparison mode, the detected target theme is preferred.",
             )
-            watchlist = st.selectbox("Watchlist", list(SCREENER_WATCHLISTS.keys()), index=0)
+            watchlist = st.selectbox(
+                "Watchlist",
+                list(SCREENER_WATCHLISTS.keys()),
+                index=0,
+                help="Used only in Theme Screener mode.",
+            )
         with col2:
             benchmark = normalize_ticker(
-                st.text_input("Benchmark", value=str(preset.get("benchmark", target_universe.get("benchmark") or SCREENER_CONFIG["default_benchmark"])))
+                st.text_input(
+                    "Benchmark",
+                    value=str(preset.get("benchmark", target_universe.get("benchmark") or SCREENER_CONFIG["default_benchmark"])),
+                    help="Primary comparison ticker. Reflected in RS vs Benchmark, benchmark filters, scoring context, and bucket charts.",
+                )
             )
             market_benchmark = normalize_ticker(
-                st.text_input("Market benchmark", value=str(preset.get("market_benchmark", target_universe.get("market_benchmark") or SCREENER_CONFIG["default_market_benchmark"])))
+                st.text_input(
+                    "Market benchmark",
+                    value=str(preset.get("market_benchmark", target_universe.get("market_benchmark") or SCREENER_CONFIG["default_market_benchmark"])),
+                    help="Broad-market comparison ticker. Reflected in the market-relative strength column and score context.",
+                )
             )
             timeframe_options = list(SCREENER_TIMEFRAME_WINDOWS.keys())
             timeframe = st.selectbox(
                 "Timeframe",
                 timeframe_options,
                 index=timeframe_options.index(str(preset.get("timeframe", SCREENER_CONFIG["default_timeframe"]))),
+                help="Return window for screener momentum, relative strength, ranking, and charts.",
             )
         with col3:
             filters = preset.get("filters", {}) if isinstance(preset.get("filters"), dict) else {}
-            min_price = st.number_input("Minimum price", min_value=0.0, value=float(filters.get("min_price", SCREENER_CONFIG["default_min_price"])), step=1.0)
+            min_price = st.number_input(
+                "Minimum price",
+                min_value=0.0,
+                value=float(filters.get("min_price", SCREENER_CONFIG["default_min_price"])),
+                step=1.0,
+                help="Liquidity/suitability filter. Tickers below this latest price are removed from displayed results.",
+            )
             min_dollar_volume = st.number_input(
                 "Minimum dollar volume",
                 min_value=0.0,
                 value=float(filters.get("min_dollar_volume", SCREENER_CONFIG["default_min_dollar_volume"])),
                 step=1_000_000.0,
+                help="Liquidity filter using latest price times latest volume. Names below this value are removed from displayed results.",
             )
-            top_n = st.number_input("Top N", min_value=1, max_value=int(SCREENER_CONFIG["max_tickers"]), value=int(filters.get("top_n", SCREENER_CONFIG["default_top_n"])))
+            top_n = st.number_input(
+                "Top N",
+                min_value=1,
+                max_value=int(SCREENER_CONFIG["max_tickers"]),
+                value=int(filters.get("top_n", SCREENER_CONFIG["default_top_n"])),
+                help="Limits how many filtered rows are shown after sorting.",
+            )
 
         comparison_default = ", ".join(preset.get("comparison_tickers", target_universe["tickers"]))
         comparison_tickers_text = st.text_area(
@@ -1174,7 +1215,12 @@ def group_screener_results_by_bucket(results_df: pd.DataFrame) -> dict[str, pd.D
     return grouped
 
 
-def render_bucket_table(bucket_name: str, bucket_df: pd.DataFrame) -> None:
+def render_bucket_table(
+    bucket_name: str,
+    bucket_df: pd.DataFrame,
+    benchmark: str = "QQQ",
+    market_benchmark: str = "SPY",
+) -> None:
     if bucket_df.empty:
         st.info("No tickers in this bucket.")
         return
@@ -1182,7 +1228,7 @@ def render_bucket_table(bucket_name: str, bucket_df: pd.DataFrame) -> None:
         _bucket_table_columns(bucket_df),
         use_container_width=True,
         hide_index=True,
-        column_config=_bucket_column_config(),
+        column_config=_bucket_column_config(benchmark=benchmark, market_benchmark=market_benchmark),
     )
     details = _bucket_detail_columns(bucket_df)
     if not details.empty:
@@ -1211,8 +1257,10 @@ def render_bucket_chart(
         "Momentum Trend Score": "Momentum Trend Score",
         "Average Daily Float Turnover": "Average Daily Float Turnover",
         "RS vs Target": "RS vs Target",
+        "RS vs Benchmark": "RS vs Benchmark",
         "RS vs QQQ": "RS vs Benchmark",
         "RS vs SPY": "RS vs SPY",
+        "RS vs Market": "RS vs SPY",
         "RS vs Theme": "RS vs Theme",
         "Timeframe Return": "Timeframe Return",
         "ATR % / Risk": "ATR %",
@@ -1233,7 +1281,17 @@ def render_bucket_chart(
         st.info("Float turnover unavailable for this bucket.")
         return
 
-    percent_chart = chart_type in {"RS vs Target", "RS vs QQQ", "RS vs SPY", "RS vs Theme", "Timeframe Return", "ATR % / Risk", "ATR % Price"}
+    percent_chart = chart_type in {
+        "RS vs Target",
+        "RS vs Benchmark",
+        "RS vs QQQ",
+        "RS vs Market",
+        "RS vs SPY",
+        "RS vs Theme",
+        "Timeframe Return",
+        "ATR % / Risk",
+        "ATR % Price",
+    }
     y_values = chart_df[column] * 100 if percent_chart else chart_df[column]
     colors = [
         "#22d3ee" if target_ticker and normalize_ticker(ticker) == normalize_ticker(target_ticker) else "#60a5fa"
@@ -1388,7 +1446,12 @@ def render_bucket_analysis_section(
             target_row = _target_row(results_df, target_ticker)
             _render_bucket_summary(bucket_name=bucket_name, bucket_df=bucket_df, target_ticker=target_ticker)
             if SCREENER_BUCKET_ANALYSIS_CONFIG.get("show_bucket_tables", True):
-                render_bucket_table(bucket_name=bucket_name, bucket_df=bucket_df)
+                render_bucket_table(
+                    bucket_name=bucket_name,
+                    bucket_df=bucket_df,
+                    benchmark=benchmark,
+                    market_benchmark=market_benchmark,
+                )
             if SCREENER_BUCKET_ANALYSIS_CONFIG.get("show_bucket_charts", True):
                 default_chart = str(SCREENER_BUCKET_ANALYSIS_CONFIG.get("default_bucket_chart", "Combined Overlay Score"))
                 chart_type = st.selectbox(
@@ -1490,13 +1553,13 @@ def _bucket_detail_columns(bucket_df: pd.DataFrame) -> pd.DataFrame:
     return display
 
 
-def _bucket_column_config() -> dict:
+def _bucket_column_config(benchmark: str = "QQQ", market_benchmark: str = "SPY") -> dict:
     return {
         "Momentum Trend Score": st.column_config.ProgressColumn("Momentum", min_value=0, max_value=100, format="%.0f"),
         "Timeframe Return": st.column_config.NumberColumn("Timeframe Return", format="%.1f%%"),
         "RS vs Target": st.column_config.NumberColumn("RS vs Target", format="%.1f%%"),
-        "RS vs Benchmark": st.column_config.NumberColumn("RS vs QQQ", format="%.1f%%"),
-        "RS vs SPY": st.column_config.NumberColumn("RS vs SPY", format="%.1f%%"),
+        "RS vs Benchmark": st.column_config.NumberColumn(f"RS vs {benchmark}", format="%.1f%%"),
+        "RS vs SPY": st.column_config.NumberColumn(f"RS vs {market_benchmark}", format="%.1f%%"),
     }
 
 
@@ -1570,16 +1633,122 @@ def _approx_overlay_history(frame: pd.DataFrame, timeframe: str) -> pd.Series:
     return overlay.dropna().clip(0, 100).tail(252)
 
 
+def _render_screener_control_impact(controls: dict, scored_count: int, filtered_count: int, shown_count: int) -> None:
+    st.markdown("**How the current controls affect these results**")
+    impact_rows = [
+        {
+            "Control": "Screener mode",
+            "Current": controls.get("mode", "N/A"),
+            "Affects": "Which tickers enter the universe before scoring.",
+            "Where reflected": "Universe count, ranking table, bucket tables, and charts.",
+        },
+        {
+            "Control": "Theme group",
+            "Current": controls.get("theme", "N/A"),
+            "Affects": "Theme peers and theme median used for RS vs Theme.",
+            "Where reflected": "RS vs Theme, Theme Peers bucket, target summary.",
+        },
+        {
+            "Control": "Benchmark",
+            "Current": controls.get("benchmark", "N/A"),
+            "Affects": "Primary relative-strength benchmark.",
+            "Where reflected": "RS vs Benchmark, benchmark filter, score, bucket charts.",
+        },
+        {
+            "Control": "Market benchmark",
+            "Current": controls.get("market_benchmark", "N/A"),
+            "Affects": "Broad-market comparison.",
+            "Where reflected": f"RS vs {controls.get('market_benchmark', 'Market')} column and relative-strength score context.",
+        },
+        {
+            "Control": "Minimum dollar volume",
+            "Current": _format_dollar(controls.get("min_dollar_volume")),
+            "Affects": "Liquidity filter: latest price times latest volume.",
+            "Where reflected": f"Filters {scored_count - filtered_count} names before Top N.",
+        },
+        {
+            "Control": "Top N",
+            "Current": str(controls.get("top_n", "N/A")),
+            "Affects": "How many filtered names are displayed.",
+            "Where reflected": f"Showing {shown_count} of {filtered_count} filtered names.",
+        },
+    ]
+    with st.expander("Controls impact", expanded=False):
+        st.dataframe(pd.DataFrame(impact_rows), use_container_width=True, hide_index=True)
+
+
 def _render_selected_ticker_preview(df: pd.DataFrame, timeframe: str, benchmark: str) -> None:
     st.subheader("Selected Ticker Preview")
-    selected = st.selectbox("Select ticker", df["Ticker"].tolist())
+    st.caption("Use this drilldown to inspect one row from the current results table. It does not re-run the screener by itself.")
+    selected = st.selectbox("Select ticker", df["Ticker"].tolist(), key="screener_selected_preview_ticker")
     row = df.loc[df["Ticker"] == selected].iloc[0]
     st.markdown(f"**{selected} - {row['Label']}**")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Score", f"{row['Momentum Trend Score']:.0f}/100")
-    c2.metric(f"{timeframe} Return", _format_pct(row["Timeframe Return"]))
-    c3.metric(f"RS vs {benchmark}", _format_pct(row["RS vs Benchmark"]))
-    c4.metric("RS vs Theme", _format_pct(row["RS vs Theme"]))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Rank", f"{int(row['Rank'])} / {len(df)}")
+    c2.metric("Score", f"{row['Momentum Trend Score']:.0f}/100")
+    c3.metric(f"{timeframe} Return", _format_pct(row["Timeframe Return"]))
+    c4.metric(f"RS vs {benchmark}", _format_pct(row["RS vs Benchmark"]))
+    c5.metric("RS vs Theme", _format_pct(row["RS vs Theme"]))
+
+    c6, c7, c8, c9 = st.columns(4)
+    c6.metric("Bucket", str(row.get("Bucket", "Universe")))
+    c7.metric("Price", _format_price(row.get("Price")))
+    c8.metric("Dollar Volume", _format_dollar(row.get("Dollar Volume")))
+    c9.metric("ATR Risk", _format_pct(row.get("ATR %")))
+
+    score_columns = [
+        "Price Trend Score",
+        "Momentum Score",
+        "Relative Strength Score",
+        "Volume Confirmation Score",
+        "Risk Volatility Score",
+    ]
+    score_df = pd.DataFrame(
+        {
+            "Component": [label.replace(" Score", "") for label in score_columns],
+            "Points": [_number(row.get(column)) or 0.0 for column in score_columns],
+        }
+    )
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=score_df["Component"],
+                y=score_df["Points"],
+                marker_color=["#22d3ee", "#60a5fa", "#a78bfa", "#22c55e", "#f59e0b"],
+                text=[f"{value:.0f}" for value in score_df["Points"]],
+                textposition="outside",
+            )
+        ]
+    )
+    fig.update_layout(
+        title=f"{selected} score breakdown",
+        height=330,
+        template="plotly_dark",
+        margin=dict(l=20, r=20, t=55, b=40),
+        yaxis=dict(title="Points", range=[0, max(30, float(score_df["Points"].max()) + 8)]),
+        xaxis_title="",
+    )
+    st.plotly_chart(fig, width="stretch", key=f"screener_preview_score_breakdown_{selected}")
+
+    relative_rows = [
+        ("RS vs Target", row.get("RS vs Target")),
+        (f"RS vs {benchmark}", row.get("RS vs Benchmark")),
+        ("RS vs Market", row.get("RS vs SPY")),
+        ("RS vs Theme", row.get("RS vs Theme")),
+        ("RS vs Peer Median", row.get("RS vs Peer Median")),
+        ("RS vs Sector", row.get("RS vs Sector")),
+        ("RS vs Industry", row.get("RS vs Industry")),
+    ]
+    relative_df = pd.DataFrame(
+        [
+            {"Comparison": label, "Gap": _format_pct(value), "Read": _relative_read(value)}
+            for label, value in relative_rows
+            if _number(value) is not None
+        ]
+    )
+    if not relative_df.empty:
+        st.dataframe(relative_df, use_container_width=True, hide_index=True)
+
     st.info(_quick_conclusion(row=row, timeframe=timeframe, benchmark=benchmark))
     if st.button("Open in MR-1 Dashboard", type="primary", key=f"open_screener_{selected}"):
         st.session_state["ticker_search"] = selected
@@ -1660,13 +1829,13 @@ def _advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
     return display
 
 
-def _column_config() -> dict:
+def _column_config(benchmark: str = "Benchmark", market_benchmark: str = "Market") -> dict:
     return {
         "Momentum Trend Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
         "Timeframe Return": st.column_config.NumberColumn("Timeframe Return", format="%.1f%%"),
         "RS vs Target": st.column_config.NumberColumn("RS vs Target", format="%.1f%%"),
-        "RS vs Benchmark": st.column_config.NumberColumn("RS vs Benchmark", format="%.1f%%"),
-        "RS vs SPY": st.column_config.NumberColumn("RS vs SPY", format="%.1f%%"),
+        "RS vs Benchmark": st.column_config.NumberColumn(f"RS vs {benchmark}", format="%.1f%%"),
+        "RS vs SPY": st.column_config.NumberColumn(f"RS vs {market_benchmark}", format="%.1f%%"),
         "RS vs Theme": st.column_config.NumberColumn("RS vs Theme", format="%.1f%%"),
     }
 
@@ -1681,7 +1850,7 @@ def _advanced_column_config() -> dict:
         "Distance 50D SMA": st.column_config.NumberColumn("Dist 50D", format="%.1f%%"),
         "Distance 200D SMA": st.column_config.NumberColumn("Dist 200D", format="%.1f%%"),
         "RS vs Target": st.column_config.NumberColumn("RS vs Target", format="%.1f%%"),
-        "RS vs SPY": st.column_config.NumberColumn("RS vs SPY", format="%.1f%%"),
+        "RS vs SPY": st.column_config.NumberColumn("RS vs Market", format="%.1f%%"),
         "RS vs Sector": st.column_config.NumberColumn("RS vs Sector", format="%.1f%%"),
         "RS vs Industry": st.column_config.NumberColumn("RS vs Industry", format="%.1f%%"),
         "Volume Percentile": st.column_config.NumberColumn("Volume Percentile", format="%.0f%%"),
@@ -1837,6 +2006,37 @@ def _format_pct(value) -> str:
     if number is None or not math.isfinite(number):
         return "N/A"
     return f"{number * 100:.1f}%"
+
+
+def _format_price(value) -> str:
+    number = _number(value)
+    if number is None:
+        return "N/A"
+    return f"${number:,.2f}"
+
+
+def _format_dollar(value) -> str:
+    number = _number(value)
+    if number is None:
+        return "N/A"
+    if abs(number) >= 1_000_000_000:
+        return f"${number / 1_000_000_000:.1f}B"
+    if abs(number) >= 1_000_000:
+        return f"${number / 1_000_000:.1f}M"
+    return f"${number:,.0f}"
+
+
+def _relative_read(value) -> str:
+    number = _number(value)
+    if number is None:
+        return "Unavailable"
+    if number >= 0.03:
+        return "Clear leadership"
+    if number > 0:
+        return "Slight leadership"
+    if number <= -0.03:
+        return "Clear lag"
+    return "Slight lag"
 
 
 def _number(value) -> float | None:
