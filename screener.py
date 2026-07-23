@@ -1452,6 +1452,12 @@ def render_bucket_analysis_section(
         return
 
     st.subheader("Bucket Analysis")
+    st.caption(
+        "This is the Screener's cross-sectional decision layer: it shows whether the target is leading "
+        "its direct peers, sector peers, industry peers, theme peers, and benchmarks."
+    )
+    _render_bucket_decision_snapshot(grouped=grouped, results_df=results_df, target_ticker=target_ticker)
+
     tab_names = [*grouped.keys()]
     if SCREENER_BUCKET_ANALYSIS_CONFIG.get("show_overlay_history_chart", True):
         tab_names.append("All Buckets Overlay")
@@ -1506,6 +1512,142 @@ def render_bucket_analysis_section(
                     target_ticker=target_ticker,
                     target_row=target_row,
                 )
+
+
+def render_screener_context_snapshot(
+    target_ticker: str | None = None,
+    title: str = "Latest Screener Bucket Context",
+    show_empty: bool = False,
+) -> None:
+    last_run = st.session_state.get("screener_last_run")
+    if not isinstance(last_run, dict):
+        if show_empty:
+            st.info("No Screener run is available yet. Run the Screener tab to populate peer/bucket context here.")
+        return
+
+    scored = last_run.get("scored", pd.DataFrame())
+    controls = last_run.get("controls", {})
+    if scored is None or scored.empty:
+        if show_empty:
+            st.info("No Screener run is available yet. Run the Screener tab to populate peer/bucket context here.")
+        return
+
+    target = normalize_ticker(target_ticker or controls.get("target_ticker") or "")
+    if not target or target not in set(scored["Ticker"]):
+        target = normalize_ticker(str(scored.iloc[0].get("Ticker", "")))
+    grouped = group_screener_results_by_bucket(scored)
+
+    st.subheader(title)
+    st.caption(
+        f"From latest Screener run: {controls.get('mode', 'Screener')} | "
+        f"TF {controls.get('timeframe', 'N/A')} | Benchmark {controls.get('benchmark', 'N/A')} | "
+        f"Market {controls.get('market_benchmark', 'N/A')}"
+    )
+    _render_bucket_decision_snapshot(grouped=grouped, results_df=scored, target_ticker=target)
+
+
+def _render_bucket_decision_snapshot(
+    grouped: dict[str, pd.DataFrame],
+    results_df: pd.DataFrame,
+    target_ticker: str | None,
+) -> None:
+    if results_df.empty:
+        return
+
+    target = normalize_ticker(target_ticker or "")
+    target_row = _target_row(results_df, target)
+    ranked = results_df.sort_values("Momentum Trend Score", ascending=False).reset_index(drop=True)
+    if target_row is not None and target in set(ranked["Ticker"]):
+        target_rank = int(ranked.index[ranked["Ticker"] == target][0]) + 1
+        target_score = _number(target_row.get("Momentum Trend Score")) or 0.0
+        target_label = str(target_row.get("Label", "Unavailable"))
+    else:
+        target_rank = None
+        target_score = 0.0
+        target_label = "Unavailable"
+
+    summary = _bucket_summary_frame(grouped=grouped, target_ticker=target)
+    strongest_bucket = "N/A"
+    weakest_bucket = "N/A"
+    if not summary.empty:
+        strongest_bucket = str(summary.sort_values("Avg Score", ascending=False).iloc[0]["Bucket"])
+        weakest_bucket = str(summary.sort_values("Avg Score", ascending=True).iloc[0]["Bucket"])
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Target Rank", "N/A" if target_rank is None else f"{target_rank} / {len(ranked)}")
+    col2.metric("Target Score", f"{target_score:.0f} / 100")
+    col3.metric("Target Label", target_label)
+    col4.metric("Strongest Bucket", strongest_bucket)
+
+    if target_row is not None:
+        st.info(_bucket_decision_read(target=target, target_row=target_row, summary=summary, weakest_bucket=weakest_bucket))
+
+    if not summary.empty:
+        display = summary.copy()
+        for column in ["Avg Return", "Target RS"]:
+            if column in display.columns:
+                display[column] = display[column] * 100
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Avg Score": st.column_config.ProgressColumn("Avg Score", min_value=0, max_value=100, format="%.0f"),
+                "Avg Return": st.column_config.NumberColumn("Avg Return", format="%.1f%%"),
+                "Target RS": st.column_config.NumberColumn("Target RS", format="%.1f%%"),
+            },
+        )
+
+
+def _bucket_summary_frame(grouped: dict[str, pd.DataFrame], target_ticker: str | None) -> pd.DataFrame:
+    rows = []
+    target = normalize_ticker(target_ticker or "")
+    for bucket_name, bucket_df in grouped.items():
+        if bucket_df.empty:
+            continue
+        ranked = bucket_df.sort_values("Momentum Trend Score", ascending=False).reset_index(drop=True)
+        target_rows = ranked.loc[ranked["Ticker"] == target] if target else pd.DataFrame()
+        target_rank = "N/A"
+        target_rs = np.nan
+        if not target_rows.empty:
+            target_rank = f"{int(target_rows.index[0]) + 1} / {len(ranked)}"
+            target_return = _number(target_rows.iloc[0].get("Timeframe Return"))
+            bucket_return = _number(bucket_df["Timeframe Return"].mean()) if "Timeframe Return" in bucket_df else None
+            if target_return is not None and bucket_return is not None:
+                target_rs = target_return - bucket_return
+        rows.append(
+            {
+                "Bucket": bucket_name,
+                "Tickers": len(bucket_df),
+                "Top Ticker": str(ranked.iloc[0].get("Ticker", "N/A")),
+                "Avg Score": float(bucket_df["Momentum Trend Score"].mean()) if "Momentum Trend Score" in bucket_df else np.nan,
+                "Avg Return": float(bucket_df["Timeframe Return"].mean()) if "Timeframe Return" in bucket_df else np.nan,
+                "Target Rank": target_rank,
+                "Target RS": target_rs,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _bucket_decision_read(target: str, target_row: pd.Series, summary: pd.DataFrame, weakest_bucket: str) -> str:
+    score = _number(target_row.get("Momentum Trend Score")) or 0.0
+    label = str(target_row.get("Label", "Unavailable"))
+    rs_target = _format_pct(target_row.get("RS vs Target"))
+    rs_peer = _format_pct(target_row.get("RS vs Peer Median"))
+    rs_sector = _format_pct(target_row.get("RS vs Sector"))
+    rs_industry = _format_pct(target_row.get("RS vs Industry"))
+    rank_reads = []
+    if not summary.empty:
+        for _, row in summary.iterrows():
+            target_rank = str(row.get("Target Rank", "N/A"))
+            if target_rank != "N/A":
+                rank_reads.append(f"{row['Bucket']} {target_rank}")
+    rank_text = "; ".join(rank_reads[:4]) if rank_reads else "target is not inside the displayed bucket tabs"
+    return (
+        f"{target} is {label} at {score:.0f}/100. Bucket rank read: {rank_text}. "
+        f"Relative gaps: vs target {rs_target}, vs peer median {rs_peer}, vs sector {rs_sector}, vs industry {rs_industry}. "
+        f"Weakest comparison bucket: {weakest_bucket}."
+    )
 
 
 def _render_bucket_summary(bucket_name: str, bucket_df: pd.DataFrame, target_ticker: str | None = None) -> None:

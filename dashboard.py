@@ -56,7 +56,7 @@ from regime_persistence import (
 )
 from relative_context import analyze_relative_context
 from relative_trend_quality import calculate_clean_relative_trend_score
-from screener import render_screener_tab
+from screener import render_screener_context_snapshot, render_screener_tab
 from scoring import (
     apply_relative_context_adjustment,
     backtest_metrics,
@@ -379,6 +379,7 @@ def render_dashboard() -> None:
             adjusted_exposure=relative_adjusted_exposure,
         )
         _render_clean_relative_trend_card(clean_relative_trend, show_chart=True)
+        render_screener_context_snapshot(target_ticker=ticker, title="Latest Screener Bucket Context")
         _render_regime_score_analysis(scored=scored, signals=signals, latest_regime=str(latest["Regime"]))
         _render_hmm_summary(hmm_result=hmm_result, rule_regime=str(latest["Regime"]))
         _render_regime_guide(str(latest["Regime"]))
@@ -2921,6 +2922,91 @@ def _render_combined_risk_overlay(
     st.info(_combined_overlay_read(regime_persistence, options_context, event_context))
 
 
+def _render_recommendation_layer_matrix(
+    latest: pd.Series,
+    action: str,
+    exposure: float,
+    confidence: str,
+    regime_persistence: RegimePersistenceResult,
+    options_context: OptionsVolatilityResult,
+    event_context: EventContextResult,
+    hmm_result: HMMResult,
+    swing_result: SwingResult,
+    clean_relative_trend: dict,
+    combined_risk_overlay: dict,
+    comparison_ticker: str,
+    comparison_type: str,
+) -> None:
+    overlay_score = combined_risk_overlay.get("overlay_score") if combined_risk_overlay.get("available") else None
+    clean_score = clean_relative_trend.get("score") if clean_relative_trend.get("available") else None
+    rows = pd.DataFrame(
+        [
+            {
+                "Layer": "Final Risk Overlay",
+                "Read": "Unavailable" if overlay_score is None else f"{float(overlay_score):.0f} / 100 - {combined_risk_overlay.get('overlay_label', 'Unavailable')}",
+                "Decision Use": combined_risk_overlay.get("final_recommendation", action),
+                "Status": "Primary",
+            },
+            {
+                "Layer": "MR-1 Regime",
+                "Read": f'{int(latest.get("MR-1 Score", 0))} / 100 - {latest.get("Regime", "Unavailable")}',
+                "Decision Use": f"{action}; exposure guide {_format_pct(exposure)}",
+                "Status": confidence,
+            },
+            {
+                "Layer": "Swing Timing",
+                "Read": f"{swing_result.score} / 100 - {swing_result.setup_label}",
+                "Decision Use": swing_result.action,
+                "Status": swing_result.score_scope,
+            },
+            {
+                "Layer": f"Relative Trend vs {comparison_ticker}",
+                "Read": "Unavailable" if clean_score is None else f"{float(clean_score):.0f} / 100 - {clean_relative_trend.get('label', 'Unavailable')}",
+                "Decision Use": f"{clean_relative_trend.get('status', 'Unavailable')} ({comparison_type})",
+                "Status": "Confirmation",
+            },
+            {
+                "Layer": "Regime Persistence",
+                "Read": _format_stability(regime_persistence),
+                "Decision Use": regime_persistence.maturity,
+                "Status": "Stability",
+            },
+            {
+                "Layer": "Volume Context",
+                "Read": str(latest.get("Volume Context", "Unavailable")),
+                "Decision Use": f'{int(latest.get("Volume Adjustment", 0) or 0):+d} MR-1 points',
+                "Status": "Participation",
+            },
+            {
+                "Layer": "Options / IV",
+                "Read": options_context.context,
+                "Decision Use": _options_action(options_context),
+                "Status": "Timing/Risk",
+            },
+            {
+                "Layer": "News / Event Risk",
+                "Read": event_context.event_risk,
+                "Decision Use": event_context.catalyst_status,
+                "Status": "Catalyst",
+            },
+            {
+                "Layer": "HMM Market Filter",
+                "Read": hmm_result.regime if hmm_result.available else "Unavailable",
+                "Decision Use": _hmm_action(hmm_result),
+                "Status": hmm_result.transition_risk if hmm_result.available else "Unavailable",
+            },
+        ]
+    )
+    st.subheader("Decision Matrix")
+    st.caption("This table shows which layers support the final recommendation and which ones are only timing/risk modifiers.")
+    st.dataframe(
+        rows.style.map(_overlay_action_style, subset=["Read", "Decision Use", "Status"]),
+        use_container_width=True,
+        hide_index=True,
+        height=_table_height(rows),
+    )
+
+
 def _render_recommendation(
     ticker: str,
     benchmark: str,
@@ -2943,16 +3029,38 @@ def _render_recommendation(
     confidence = _confidence_label(latest_score, signals)
     positives = [signal for signal in signals if signal.score > 0]
     negatives = [signal for signal in signals if signal.score == 0]
+    latest = scored.iloc[-1]
 
+    st.subheader("Recommendation")
+    _render_scope_badges(
+        [
+            ("Final Layer", combined_risk_overlay.get("final_recommendation", action)),
+            ("MR-1", f"{latest_score}/100 {latest_regime}"),
+            ("Exposure", _format_pct(exposure)),
+            ("Comparison", f"{comparison_ticker} ({comparison_type})"),
+        ]
+    )
     _render_final_decision(combined_risk_overlay)
 
-    st.subheader("MR-1 Recommendation Context")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("MR-1 Action", action)
-    col2.metric("MR-1 Exposure", _format_pct(exposure))
-    col3.metric("Signal Confidence", confidence)
+    _render_recommendation_layer_matrix(
+        latest=latest,
+        action=action,
+        exposure=exposure,
+        confidence=confidence,
+        regime_persistence=regime_persistence,
+        options_context=options_context,
+        event_context=event_context,
+        hmm_result=hmm_result,
+        swing_result=swing_result,
+        clean_relative_trend=clean_relative_trend,
+        combined_risk_overlay=combined_risk_overlay,
+        comparison_ticker=comparison_ticker,
+        comparison_type=comparison_type,
+    )
 
-    st.subheader("Explanation")
+    render_screener_context_snapshot(target_ticker=ticker, title="Screener Bucket Confirmation", show_empty=True)
+
+    st.subheader("Recommendation Narrative")
     for paragraph in _recommendation_paragraphs(
         ticker=ticker,
         benchmark=benchmark,
@@ -2981,8 +3089,8 @@ def _render_recommendation(
         clean_relative_trend=clean_relative_trend,
     )
 
-    st.subheader("Volume Explanation")
-    st.write(scored.iloc[-1].get("Volume Explanation", "Volume context is unavailable."))
+    st.subheader("Volume / Participation Read")
+    st.write(latest.get("Volume Explanation", "Volume context is unavailable."))
 
     _render_combined_risk_overlay(
         combined_risk_overlay=combined_risk_overlay,
