@@ -3176,6 +3176,7 @@ def _render_peer_context(
     latest = scored.iloc[-1]
     volume_table = _build_volume_comparison_table(ticker=ticker, ticker_metadata=ticker_metadata, context=context)
     _render_peer_context_map(ticker=ticker, benchmark=benchmark, context=context)
+    render_screener_context_snapshot(target_ticker=ticker, title="Latest Screener Bucket Context", show_empty=False)
     _render_scope_badges(
         [
             ("Regime", "Latest reading"),
